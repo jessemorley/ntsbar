@@ -101,19 +101,26 @@ struct Feed { var items: [Saved] = [], cursor: Any? = nil, done = false, loading
 
 let firebaseKey = "AIzaSyA4Qp5AvHC8Rev72-10-_DY614w_bxUCJU"
 let functions = "https://europe-west2-nts-ios-app.cloudfunctions.net"   // nts.live's _functions() region
+let firestore = "https://firestore.googleapis.com/v1/projects/nts-ios-app/databases/(default)/documents"
+
+/// Firestore REST field filter.
+func filter(_ field: String, _ op: String, _ value: [String: Any]) -> [String: Any] {
+    ["fieldFilter": ["field": ["fieldPath": field], "op": op, "value": value]]
+}
+func str(_ s: String) -> [String: Any] { ["stringValue": s] }
 
 struct APIError: LocalizedError { var errorDescription: String? }
 
 /// POST JSON and return the decoded reply. Google APIs report failures as {"error":{…}}
 /// (runQuery wraps it in an array), so surface that message verbatim.
-@MainActor func post(_ url: String, _ body: [String: Any], token: String? = nil) async throws -> Any {
+@MainActor func post(_ url: String, _ body: [String: Any]?, token: String? = nil, method: String = "POST") async throws -> Any {
     var r = URLRequest(url: URL(string: url)!)
-    r.httpMethod = "POST"
+    r.httpMethod = method
     r.setValue("application/json", forHTTPHeaderField: "Content-Type")
     if let token { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-    r.httpBody = try JSONSerialization.data(withJSONObject: body)
+    if let body { r.httpBody = try JSONSerialization.data(withJSONObject: body) }
     let (data, _) = try await URLSession.shared.data(for: r)
-    let json = try JSONSerialization.jsonObject(with: data)
+    let json = data.isEmpty ? [String: Any]() : try JSONSerialization.jsonObject(with: data)
     let err = (json as? [String: Any])?["error"] ?? (json as? [[String: Any]])?.first?["error"]
     if let e = err as? [String: Any] { throw APIError(errorDescription: (e["status"].map { "\($0): " } ?? "") + "\(e["message"] ?? e)") }
     return json
@@ -158,7 +165,9 @@ enum Keychain {
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
     var accountError: String?
+    var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
+    @ObservationIgnored private var deviceIDs: [String] = []
 
     init() {
         Task {
@@ -186,9 +195,80 @@ enum Keychain {
         tracklists[episodePath] = (try? await fetch(episodePath + "/tracklist")) ?? []
     }
 
-    func isSaved(_ id: String) -> Bool { saved.contains { $0.id == id } }
+    func isSaved(_ id: String) -> Bool {
+        guard email != nil else { return saved.contains { $0.id == id } }
+        return followed[id] ?? feeds.values.contains { $0.items.contains { $0.id == id } }
+    }
+
+    /// Signed out: local. Signed in: the account's Firestore favourites, updated optimistically, rolled back on error.
     func toggleSave(_ item: Saved) {
-        if isSaved(item.id) { saved.removeAll { $0.id == item.id } } else { saved.insert(item, at: 0) }
+        guard email != nil else {
+            if isSaved(item.id) { saved.removeAll { $0.id == item.id } } else { saved.insert(item, at: 0) }
+            return
+        }
+        let tab: SavedTab = item.isEpisode ? .episodes : .hosts
+        let was = isSaved(item.id), before = (followed[item.id], feeds[tab])
+        followed[item.id] = !was
+        if was { feeds[tab]?.items.removeAll { $0.id == item.id } } else { feeds[tab]?.items.insert(item, at: 0) }
+        Task {
+            do {
+                let (t, uid) = try await token()
+                if was {   // duplicates exist, so delete every match
+                    for name in try await favouriteDocs(item.id) {
+                        _ = try await post("https://firestore.googleapis.com/v1/\(name)", nil, token: t, method: "DELETE")
+                    }
+                } else {
+                    let (show, ep) = aliases(item.id)
+                    // nts.live's writeFavourite: createDocWithSession + the favourite fields
+                    let fields: [String: Any] = [
+                        "show_alias": str(show), "episode_alias": str(ep),
+                        "created_at": ["timestampValue": Date.now.ISO8601Format()],
+                        "device_id": str(uid), "client": str("NTSWebApp"),
+                        "session": ["mapValue": ["fields": ["firebase_user_uid": str(uid), "installation_id": ["nullValue": NSNull()]]]],
+                    ]
+                    _ = try await post("\(firestore)/favourites", ["fields": fields], token: t)
+                }
+                accountError = nil
+            } catch {
+                followed[item.id] = before.0; feeds[tab] = before.1   // ponytail: restores the whole feed; pages loaded mid-request are refetched later
+                accountError = error.localizedDescription
+            }
+        }
+    }
+
+    /// Reads the account state for bookmark icons once per id.
+    func checkSaved(_ ids: [String]) async {
+        guard email != nil else { return }
+        for id in ids where followed[id] == nil {
+            do { followed[id] = try await !favouriteDocs(id, limit: 1).isEmpty }
+            catch { accountError = error.localizedDescription; return }
+        }
+    }
+
+    private func aliases(_ id: String) -> (show: String, episode: String) {
+        let p = id.split(separator: "/").map(String.init)   // shows/x[/episodes/y]
+        return (p.count > 1 ? p[1] : "", p.count > 3 ? p[3] : "")
+    }
+
+    /// Firestore doc names of the favourite for a show or episode, found as nts.live's upsertFavourite does:
+    /// device_id IN [uid + user_devices], show_alias ==, episode_alias == ("" for a followed show).
+    private func favouriteDocs(_ id: String, limit: Int? = nil) async throws -> [String] {
+        let (t, uid) = try await token()
+        func query(_ q: [String: Any]) async throws -> [[String: Any]] {
+            let r = try await post("\(firestore):runQuery", ["structuredQuery": q], token: t) as? [[String: Any]] ?? []
+            return r.compactMap { $0["document"] as? [String: Any] }
+        }
+        if deviceIDs.isEmpty {   // nts.live's getUserDeviceIds: uid first, capped at 10
+            let devs = try await query(["from": [["collectionId": "user_devices"]], "where": filter("firebase_user_uid", "EQUAL", str(uid))])
+                .compactMap { (($0["fields"] as? [String: Any])?["device_id"] as? [String: Any])?["stringValue"] as? String }
+            deviceIDs = Array(([uid] + devs.filter { $0 != uid }).prefix(10))
+        }
+        let (show, ep) = aliases(id)
+        var q: [String: Any] = ["from": [["collectionId": "favourites"]], "where": ["compositeFilter": ["op": "AND", "filters": [
+            filter("device_id", "IN", ["arrayValue": ["values": deviceIDs.map(str)]]),
+            filter("show_alias", "EQUAL", str(show)), filter("episode_alias", "EQUAL", str(ep))]]]]
+        if let limit { q["limit"] = limit }
+        return try await query(q).compactMap { $0["name"] as? String }
     }
 
     func signIn(_ email: String, _ password: String) async {
@@ -201,13 +281,13 @@ enum Keychain {
             self.email = email
             UserDefaults.standard.set(email, forKey: "email")
             accountError = nil
-            feeds = [:]
+            feeds = [:]; followed = [:]; deviceIDs = []
         } catch { accountError = error.localizedDescription }
     }
 
     func signOut() {
         Keychain.refreshToken = nil
-        session = nil; email = nil; feeds = [:]; accountError = nil
+        session = nil; email = nil; feeds = [:]; accountError = nil; followed = [:]; deviceIDs = []
         UserDefaults.standard.removeObject(forKey: "email")
     }
 
@@ -400,6 +480,11 @@ struct RootView: View {
                 Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
                     .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * progress(at: ctx.date)) }
             }
+            if let err = store.accountError {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
+                Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
+                    .onTapGesture { store.accountError = nil }
+            }
             Group {
                 switch page {
                 case .live: LiveView()
@@ -505,6 +590,9 @@ struct SaveMenu: View {
                 Image(systemName: store.isSaved(showItem.id) ? "bookmark.fill" : "bookmark").font(.system(size: size))
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+            .task(id: "\(showItem.id)|\(d?.episodeAlias ?? "")|\(store.email ?? "")") {
+                await store.checkSaved([showItem.id] + (d?.episodeAlias.map { ["/shows/\(show)/episodes/\($0)"] } ?? []))
+            }
         }
     }
 }
@@ -597,10 +685,6 @@ struct SavedView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
-                    if let err = store.accountError {
-                        Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
-                            .padding(.horizontal, 9).padding(.top, 8)
-                    }
                     let loading = store.feeds[tab]?.loading == true
                     if tab == .history {
                         empty("HISTORY COMING SOON")
@@ -611,7 +695,7 @@ struct SavedView: View {
                         Row(image: s.image, title: s.title, subtitle: s.subtitle, active: false)
                             // ponytail: opens nts.live; archive audio is SoundCloud/Mixcloud, in-app playback needs a hidden WKWebView embed
                             .onTapGesture { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + s.id)!) }
-                            .contextMenu { if store.email == nil { Button("Remove") { store.toggleSave(s) } } }
+                            .contextMenu { if tab != .history { Button(tab == .hosts ? "Unfollow Show" : "Remove Episode") { store.toggleSave(s) } } }
                             .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
                         Rule()
                     }
