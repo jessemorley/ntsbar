@@ -239,7 +239,13 @@ enum Keychain {
         problem = error.localizedDescription
     }
 
-    func seek(_ seconds: Double) { player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) }
+    var scrub: Double?   // 0…1 while dragging the tab divider over an archive episode
+    var seekable: Bool { episode?.id == playingID && duration > 0 }
+    /// Seeks to the dragged spot, holding the handle there until the seek lands.
+    func endScrub() {
+        guard let f = scrub else { return }
+        Task { await player.seek(to: CMTime(seconds: f * duration, preferredTimescale: 600)); scrub = nil }
+    }
 
     func loadTracklist(_ episodePath: String) async {
         guard tracklists[episodePath] == nil else { return }
@@ -510,10 +516,11 @@ enum Page: CaseIterable { case live, nowPlaying, mixtapes, saved
 struct RootView: View {
     @Environment(Store.self) var store
     @State var page = Page.live
+    @State private var barHover = false
 
     /// The divider doubles as the playing live show's progress bar; solid otherwise.
     func progress(at now: Date) -> Double {
-        if let e = store.episode, e.id == store.playingID { return store.position / max(1, store.duration) }
+        if store.seekable { return store.scrub ?? store.position / store.duration }
         guard let id = store.playingID, let c = store.live.first(where: { $0.id == id }) else { return 1 }
         return fraction(c.now, at: now)
     }
@@ -535,9 +542,25 @@ struct RootView: View {
             }
             .padding(.bottom, 2)
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                let f = progress(at: ctx.date)
                 Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
-                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * progress(at: ctx.date)) }
+                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * f) }
+                    .overlay(alignment: .leading) {   // archive episodes: a handle on hover, drag to seek
+                        if store.seekable && (barHover || store.scrub != nil) {
+                            Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
+                        }
+                    }
             }
+            .overlay {
+                if store.seekable {
+                    Color.clear.frame(height: 14).contentShape(.rect)
+                        .onHover { barHover = $0 }
+                        .gesture(DragGesture(minimumDistance: 0)
+                            .onChanged { store.scrub = min(1, max(0, $0.location.x / 360)) }
+                            .onEnded { _ in store.endScrub() })
+                }
+            }
+            .zIndex(1)   // handle and hit area overlap the page below
             if let err = store.problem {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
                 Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
@@ -948,7 +971,6 @@ struct EpisodeNowView: View {
     @Environment(Store.self) var store
     let id: String, d: Details
     @State private var showTracklist = false
-    @State private var drag: Double?   // 0…1 while scrubbing
 
     var path: String { String(id.dropFirst()) }
 
@@ -978,28 +1000,12 @@ struct EpisodeNowView: View {
                                 .frame(width: 20, height: 24).contentShape(.rect)
                             }
                             .buttonStyle(.plain)
-                            GeometryReader { g in
-                                let f = drag ?? (dur > 0 ? pos / dur : 0)
-                                ZStack(alignment: .leading) {
-                                    Rectangle().fill(.white.opacity(0.3)).frame(height: 2)
-                                    Rectangle().fill(.white).frame(width: g.size.width * f, height: 2)
-                                    Circle().fill(.white).frame(width: 10, height: 10).offset(x: g.size.width * f - 5)
-                                }
-                                .frame(maxHeight: .infinity).contentShape(.rect)
-                                .gesture(DragGesture(minimumDistance: 0)
-                                    .onChanged { drag = min(1, max(0, $0.location.x / g.size.width)) }
-                                    // ponytail: the thumb can flick back for a beat until the seek lands
-                                    .onEnded { _ in if let drag, dur > 0 { store.seek(drag * dur) }; drag = nil })
-                            }
-                            .frame(height: 24)
-                        }
-                        .padding(.horizontal, pageInset).padding(.top, 10)
-                        HStack {
-                            Text(clock(drag.map { $0 * dur } ?? pos))
+                            let at = store.scrub.map { $0 * dur } ?? pos
+                            Text(clock(at))
                             Spacer()
-                            Text("-" + clock(dur - (drag.map { $0 * dur } ?? pos))).opacity(0.6)
+                            Text("-" + clock(dur - at)).opacity(0.6)
                         }
-                        .font(.nts(10.5, .regular)).padding(.leading, pageInset + 32).padding(.trailing, pageInset)
+                        .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 10)
                         EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
                         Spacer(minLength: 20)
                     }
