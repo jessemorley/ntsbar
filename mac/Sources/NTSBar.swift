@@ -229,7 +229,14 @@ enum Keychain {
             episode = (id, d)
             toggle(id, hls.absoluteString)
             problem = nil
-        } catch { problem = error.localizedDescription }
+        } catch { report(error) }
+    }
+
+    /// Shows an error under the tab bar, except cancellations: SwiftUI cancels a view's .task
+    /// (bookmark check, page load) when the popover closes or the page changes mid-request.
+    func report(_ error: Error) {
+        if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+        problem = error.localizedDescription
     }
 
     func seek(_ seconds: Double) { player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) }
@@ -275,7 +282,7 @@ enum Keychain {
                 problem = nil
             } catch {
                 followed[item.id] = before.0; feeds[tab] = before.1   // ponytail: restores the whole feed; pages loaded mid-request are refetched later
-                problem = error.localizedDescription
+                report(error)
             }
         }
     }
@@ -285,7 +292,7 @@ enum Keychain {
         guard email != nil else { return }
         for id in ids where followed[id] == nil {
             do { followed[id] = try await !favouriteDocs(id, limit: 1).isEmpty }
-            catch { problem = error.localizedDescription; return }
+            catch { report(error); return }
         }
     }
 
@@ -326,7 +333,7 @@ enum Keychain {
             UserDefaults.standard.set(email, forKey: "email")
             problem = nil
             feeds = [:]; followed = [:]; deviceIDs = []
-        } catch { problem = error.localizedDescription }
+        } catch { report(error) }
     }
 
     func signOut() {
@@ -373,7 +380,7 @@ enum Keychain {
                 added = items.count
             } while added == 0 && feeds[tab]?.done == false
             problem = nil
-        } catch { problem = error.localizedDescription }
+        } catch { report(error) }
     }
 }
 
