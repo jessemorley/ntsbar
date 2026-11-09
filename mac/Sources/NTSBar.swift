@@ -250,7 +250,7 @@ struct RootView: View {
                     Button { page = p } label: {
                         VStack(spacing: 4) {
                             Image(systemName: p.icon).font(.system(size: 19)).frame(height: 22)
-                            Text(p.label.nts).font(.nts(12))
+                            Text(p.label.nts).font(.nts(10))
                         }
                         .frame(maxWidth: .infinity, minHeight: 54).contentShape(.rect)
                         .opacity(page == p ? 1 : 0.45)
@@ -258,6 +258,7 @@ struct RootView: View {
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.bottom, 2)
             Rectangle().fill(.white).frame(height: 1)
             Group {
                 switch page {
@@ -267,7 +268,8 @@ struct RootView: View {
                 case .saved: SavedView()
                 }
             }
-            .frame(height: contentHeight, alignment: .top)
+            // Now Playing shrinks the window to its content; other pages keep the fixed height
+            .frame(minHeight: page == .nowPlaying ? nil : contentHeight, maxHeight: contentHeight, alignment: .top)
         }
     }
 }
@@ -509,7 +511,7 @@ struct ChannelNowView: View {
             if showTracklist, let tracks {
                 TracklistView(tracks: tracks, current: current) { showTracklist = false }
             } else {
-                ScrollView {
+                FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let end = b.endTimestamp ?? ctx.date
                         NowHeader(image: d?.media?.wide, title: b.title, progress: fraction(b, at: ctx.date)) {
@@ -539,8 +541,8 @@ struct ChannelNowView: View {
                                 .padding(.horizontal, pageInset).padding(.top, 13)
                         }
 
-                        SectionLabel(text: "Playing now")
                         if let tracks, !tracks.isEmpty {
+                            SectionLabel(text: "Playing now")
                             Button { showTracklist = true } label: {
                                 VStack(spacing: 0) {
                                     if let current { TrackRow(track: tracks[current], state: .now) }
@@ -553,9 +555,6 @@ struct ChannelNowView: View {
                                 .contentShape(.rect)
                             }
                             .buttonStyle(.plain)
-                        } else {
-                            Text(tracks == nil ? "LOADING…" : "TRACKLIST AVAILABLE AFTER BROADCAST".nts)
-                                .font(.nts(14)).opacity(0.5).padding(.horizontal, pageInset)
                         }
 
                         Spacer(minLength: 12)
@@ -569,6 +568,19 @@ struct ChannelNowView: View {
     func fraction(_ b: Broadcast, at now: Date) -> Double {
         let end = b.endTimestamp ?? now
         return max(0, min(1, now.timeIntervalSince(b.startTimestamp) / max(1, end.timeIntervalSince(b.startTimestamp))))
+    }
+}
+
+/// Content at its natural height, scrolling only once it outgrows the space offered.
+struct FitScroll<Content: View>: View {
+    @ViewBuilder let content: Content
+    @State private var height: CGFloat = contentHeight
+    var body: some View {
+        ScrollView {
+            content.onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(height: min(height, contentHeight))
     }
 }
 
@@ -623,7 +635,7 @@ struct TrackRow: View {
 struct MixtapeNowView: View {
     let mixtape: Mixtape
     var body: some View {
-        ScrollView {
+        FitScroll {
             VStack(alignment: .leading, spacing: 0) {
                 NowHeader(image: mixtape.media?.wide, title: mixtape.title, progress: 1) {
                     HStack(spacing: 7) {
