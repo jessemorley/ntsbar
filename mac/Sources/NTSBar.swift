@@ -197,7 +197,7 @@ enum Keychain {
 
     func isSaved(_ id: String) -> Bool {
         guard email != nil else { return saved.contains { $0.id == id } }
-        return followed[id] ?? feeds.values.contains { $0.items.contains { $0.id == id } }
+        return followed[id] ?? [SavedTab.hosts, .episodes].contains { feeds[$0]?.items.contains { $0.id == id } == true }
     }
 
     /// Signed out: local. Signed in: the account's Firestore favourites, updated optimistically, rolled back on error.
@@ -305,7 +305,7 @@ enum Keychain {
 
     /// Next page of hosts or episodes, from the callable functions nts.live's My NTS pages use.
     func loadMore(_ tab: SavedTab) async {
-        guard email != nil, tab != .history, feeds[tab]?.done != true, feeds[tab]?.loading != true else { return }
+        guard email != nil, feeds[tab]?.done != true, feeds[tab]?.loading != true else { return }
         feeds[tab, default: Feed()].loading = true
         defer { feeds[tab]?.loading = false }
         do {
@@ -313,9 +313,11 @@ enum Keychain {
             var added = 0
             repeat {   // the site re-asks when a page is empty but not final
                 let cursor = feeds[tab]?.cursor ?? NSNull()
-                let (fn, args, next): (String, [String: Any], String) = tab == .hosts
-                    ? ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
-                    : ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
+                let (fn, args, next): (String, [String: Any], String) = switch tab {
+                case .hosts: ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
+                case .episodes: ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
+                case .history: ("getHistoryEpisodesEurope", ["lastPlayedAt": cursor], "last_played_at")
+                }
                 let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
                 let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
                 let seen = Set(feeds[tab]?.items.map(\.id) ?? [])
@@ -661,7 +663,7 @@ struct MixtapeTile: View {
 
 struct SavedView: View {
     @Environment(Store.self) var store
-    @State private var tab = SavedTab.hosts
+    @State private var tab = CommandLine.arguments.contains("history") ? SavedTab.history : .hosts   // `--snapshot … --tab saved history`
 
     /// Signed in: the account's lists, paged in. Signed out: the local saves.
     var items: [Saved] {
@@ -686,10 +688,10 @@ struct SavedView: View {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
                     let loading = store.feeds[tab]?.loading == true
-                    if tab == .history {
-                        empty("HISTORY COMING SOON")
+                    if tab == .history && store.email == nil {
+                        empty("SIGN IN FOR HISTORY")
                     } else if items.isEmpty && !loading {
-                        empty("NOTHING SAVED YET")
+                        empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
                     }
                     ForEach(items) { s in
                         Row(image: s.image, title: s.title, subtitle: s.subtitle, active: false)
