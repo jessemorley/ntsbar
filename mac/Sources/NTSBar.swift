@@ -201,6 +201,9 @@ enum Keychain {
     let player = AVPlayer()
     var episode: (id: String, details: Details)?   // the archive episode loaded for playback
     var paused = false                              // archive only; live and mixtapes stop instead
+    var resolving = false   // fetching an archive episode's stream, before the player has an item
+    var buffering = false   // player is waiting for audio
+    var loading: Bool { resolving || buffering }
     var position: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
     var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
 
@@ -225,6 +228,7 @@ enum Keychain {
             // ponytail: polls every 30s; nts.live uses a Firestore onSnapshot listener, switch if the lag shows
             while true { await refreshMixtapeNow(); try? await Task.sleep(for: .seconds(30)) }
         }
+        statusObserver = observeStatus()
         Task {
             for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
         }
@@ -247,6 +251,16 @@ enum Keychain {
     }
 
     @ObservationIgnored private var streamURL: URL?
+    @ObservationIgnored private var statusObserver: NSKeyValueObservation?
+
+    /// KVO, not publisher(for:).values: that async sequence drops changes emitted between awaits.
+    /// nonisolated so the off-main KVO closure doesn't inherit @MainActor and trap.
+    nonisolated private func observeStatus() -> NSKeyValueObservation {
+        player.observe(\.timeControlStatus) { [weak self] p, _ in
+            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate
+            Task { @MainActor in self?.buffering = waiting }
+        }
+    }
 
     func refreshMixtapeNow() async {
         guard let id = playingID, mixtapes.contains(where: { $0.id == id }), let t = try? await mixtapeTitle(id), id == playingID else { return }
@@ -270,6 +284,7 @@ enum Keychain {
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
     func playEpisode(_ id: String) async {
         if playingID == id { pauseResume(); return }
+        resolving = true; defer { resolving = false }
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.audioSources?.first?.url ?? d.mixcloud else { throw APIError(errorDescription: "No audio for this episode") }
@@ -713,6 +728,18 @@ enum Page: CaseIterable { case live, nowPlaying, mixtapes, saved
     }
 }
 
+/// A bright band sweeping across the divider while audio loads.
+struct Shimmer: View {
+    var body: some View {
+        TimelineView(.animation) { ctx in
+            let x = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2 * 480 - 120
+            LinearGradient(colors: [.clear, .white, .clear], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 120).offset(x: x)
+                .frame(maxWidth: .infinity, alignment: .leading).clipped()
+        }
+    }
+}
+
 struct RootView: View {
     @Environment(Store.self) var store
     @State var page = Page.live
@@ -745,7 +772,8 @@ struct RootView: View {
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 let f = progress(at: ctx.date)
                 Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
-                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * f) }
+                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
+                    .overlay { if store.loading { Shimmer() } }
                     .overlay(alignment: .leading) {   // archive episodes: a handle on hover, drag to seek
                         if store.seekable && (barHover || store.scrub != nil) {
                             Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
