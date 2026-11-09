@@ -16,6 +16,10 @@ struct Tag: Decodable { var value: String }
 struct Details: Decodable {
     var name: String?, description: String?, locationLong: String?, showAlias: String?, episodeAlias: String?
     var media: Media?, genres: [Tag]?
+    // archive episodes (/shows/x/episodes/y); strings so /live's embeds can't fail to decode
+    var broadcast: String?, mixcloud: String?, audioSources: [Source]?
+    struct Source: Decodable { var url: String? }
+    var broadcastDate: Date? { broadcast.flatMap { try? Date($0, strategy: .iso8601) } }
     /// API path of this episode, e.g. shows/x/episodes/y
     var episodePath: String? { showAlias.flatMap { s in episodeAlias.map { "shows/\(s)/episodes/\($0)" } } }
 }
@@ -47,8 +51,8 @@ struct Channel: Decodable, Identifiable {
     }
 }
 struct Track: Decodable, Identifiable {
-    var uid: String, artist: String?, title: String?, offset: Int?, duration: Int?
-    var id: String { uid }
+    var uid: String?, artist: String?, title: String?, offset: Int?, duration: Int?
+    var id: String { uid ?? "" }   // uid can be null; lists key rows by position anyway
 }
 struct Credit: Decodable { var name: String, path: String }
 struct Mixtape: Decodable, Identifiable {
@@ -59,6 +63,10 @@ struct Mixtape: Decodable, Identifiable {
 struct Results<T: Decodable>: Decodable { var results: [T] }
 
 func fetch<T: Decodable>(_ path: String) async throws -> [T] {
+    try await fetchOne(path, as: Results<T>.self).results
+}
+
+func fetchOne<T: Decodable>(_ path: String, as: T.Type = T.self) async throws -> T {
     // API sends max-age=900 and CloudFront caches per header variant, so a show change can lag up to
     // 15 min. A timestamp query makes each request a cache miss (one small request a minute).
     let url = api.appending(path: path).appending(queryItems: [.init(name: "t", value: String(Int(Date().timeIntervalSince1970)))])
@@ -66,7 +74,23 @@ func fetch<T: Decodable>(_ path: String) async throws -> [T] {
     let d = JSONDecoder()
     d.keyDecodingStrategy = .convertFromSnakeCase
     d.dateDecodingStrategy = .iso8601
-    return try d.decode(Results<T>.self, from: data).results
+    return try d.decode(T.self, from: data)
+}
+
+/// Public token nts.live puts in window.nts_env (NTS_API_TOKEN) for resolve-stream.
+let ntsToken = "48fhsdjEK7349fCJBS"
+
+/// HLS link for an archive episode's SoundCloud/Mixcloud source, via nts.live's own resolver.
+func resolveStream(_ source: String) async throws -> URL {
+    let q = source.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? source
+    var r = URLRequest(url: URL(string: "\(api)/resolve-stream?url=\(q)")!)
+    r.setValue("Basic \(ntsToken)", forHTTPHeaderField: "Authorization")
+    r.setValue("application/json", forHTTPHeaderField: "Accept")
+    let (data, resp) = try await URLSession.shared.data(for: r)
+    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+    guard code == 200, let hls = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["hls"] as? String, let u = URL(string: hls)
+    else { throw APIError(errorDescription: "resolve-stream \(code): \(String(decoding: data.prefix(200), as: UTF8.self))") }
+    return u
 }
 
 // MARK: - Store
@@ -160,11 +184,15 @@ enum Keychain {
         .flatMap { try? JSONDecoder().decode([Saved].self, from: $0) } ?? [] {
         didSet { UserDefaults.standard.set(try? JSONEncoder().encode(saved), forKey: "saved") }
     }
-    private let player = AVPlayer()
+    let player = AVPlayer()
+    var episode: (id: String, details: Details)?   // the archive episode loaded for playback
+    var paused = false                              // archive only; live and mixtapes stop instead
+    var position: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
+    var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
 
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
-    var accountError: String?
+    var problem: String?
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
@@ -188,7 +216,23 @@ enum Keychain {
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
         playingID = id
+        paused = false
     }
+
+    /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
+    func playEpisode(_ id: String) async {
+        if playingID == id { paused ? player.play() : player.pause(); paused.toggle(); return }
+        do {
+            let d: Details = try await fetchOne(String(id.dropFirst()))
+            guard let source = d.audioSources?.first?.url ?? d.mixcloud else { throw APIError(errorDescription: "No audio for this episode") }
+            let hls = try await resolveStream(source)
+            episode = (id, d)
+            toggle(id, hls.absoluteString)
+            problem = nil
+        } catch { problem = error.localizedDescription }
+    }
+
+    func seek(_ seconds: Double) { player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600)) }
 
     func loadTracklist(_ episodePath: String) async {
         guard tracklists[episodePath] == nil else { return }
@@ -228,10 +272,10 @@ enum Keychain {
                     ]
                     _ = try await post("\(firestore)/favourites", ["fields": fields], token: t)
                 }
-                accountError = nil
+                problem = nil
             } catch {
                 followed[item.id] = before.0; feeds[tab] = before.1   // ponytail: restores the whole feed; pages loaded mid-request are refetched later
-                accountError = error.localizedDescription
+                problem = error.localizedDescription
             }
         }
     }
@@ -241,7 +285,7 @@ enum Keychain {
         guard email != nil else { return }
         for id in ids where followed[id] == nil {
             do { followed[id] = try await !favouriteDocs(id, limit: 1).isEmpty }
-            catch { accountError = error.localizedDescription; return }
+            catch { problem = error.localizedDescription; return }
         }
     }
 
@@ -280,14 +324,14 @@ enum Keychain {
             session = (token, uid, .now + 3000)   // ID tokens last an hour
             self.email = email
             UserDefaults.standard.set(email, forKey: "email")
-            accountError = nil
+            problem = nil
             feeds = [:]; followed = [:]; deviceIDs = []
-        } catch { accountError = error.localizedDescription }
+        } catch { problem = error.localizedDescription }
     }
 
     func signOut() {
         Keychain.refreshToken = nil
-        session = nil; email = nil; feeds = [:]; accountError = nil; followed = [:]; deviceIDs = []
+        session = nil; email = nil; feeds = [:]; problem = nil; followed = [:]; deviceIDs = []
         UserDefaults.standard.removeObject(forKey: "email")
     }
 
@@ -328,8 +372,8 @@ enum Keychain {
                 feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
                 added = items.count
             } while added == 0 && feeds[tab]?.done == false
-            accountError = nil
-        } catch { accountError = error.localizedDescription }
+            problem = nil
+        } catch { problem = error.localizedDescription }
     }
 }
 
@@ -344,7 +388,11 @@ enum Keychain {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             // --playing <id> fakes what's playing (no audio); --tab now/mixtapes opens that page
-            if let j = args.firstIndex(of: "--playing"), j + 1 < args.count { s.playingID = args[j + 1] }
+            // an episode path (/shows/x/episodes/y) really loads it, muted
+            if let j = args.firstIndex(of: "--playing"), j + 1 < args.count {
+                let id = args[j + 1]
+                if id.hasPrefix("/shows/") { s.player.isMuted = true; Task { await s.playEpisode(id) } } else { s.playingID = id }
+            }
             snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : args.contains("mixtapes") ? .mixtapes : args.contains("saved") ? .saved : .live)
         }
     }
@@ -458,6 +506,7 @@ struct RootView: View {
 
     /// The divider doubles as the playing live show's progress bar; solid otherwise.
     func progress(at now: Date) -> Double {
+        if let e = store.episode, e.id == store.playingID { return store.position / max(1, store.duration) }
         guard let id = store.playingID, let c = store.live.first(where: { $0.id == id }) else { return 1 }
         return fraction(c.now, at: now)
     }
@@ -482,10 +531,10 @@ struct RootView: View {
                 Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
                     .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * progress(at: ctx.date)) }
             }
-            if let err = store.accountError {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
+            if let err = store.problem {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
                 Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
-                    .onTapGesture { store.accountError = nil }
+                    .onTapGesture { store.problem = nil }
             }
             Group {
                 switch page {
@@ -560,7 +609,7 @@ struct ChannelCard: View {
                     }
                     .buttonStyle(.plain)
                     Spacer()
-                    SaveMenu(channel: channel)
+                    SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp)
                 }
             }
             .shadow(color: .black.opacity(0.35), radius: 3)
@@ -572,19 +621,19 @@ struct ChannelCard: View {
 
 struct SaveMenu: View {
     @Environment(Store.self) var store
-    let channel: Channel
+    let details: Details?, title: String, date: Date
     var size: CGFloat = 20
 
     var body: some View {
-        let d = channel.now.embeds?.details
+        let d = details
         if let show = d?.showAlias {
-            let showItem = Saved(id: "/shows/\(show)", title: d?.name ?? channel.now.title,
+            let showItem = Saved(id: "/shows/\(show)", title: d?.name ?? title,
                                  subtitle: d?.locationLong ?? "", image: d?.media?.thumb)
             Menu {
                 Button(store.isSaved(showItem.id) ? "Unfollow Show" : "Follow Show") { store.toggleSave(showItem) }
                 if let ep = d?.episodeAlias {
-                    let epItem = Saved(id: "/shows/\(show)/episodes/\(ep)", title: channel.now.title,
-                                       subtitle: channel.now.startTimestamp.formatted(date: .abbreviated, time: .omitted),
+                    let epItem = Saved(id: "/shows/\(show)/episodes/\(ep)", title: title,
+                                       subtitle: date.formatted(date: .abbreviated, time: .omitted),
                                        image: d?.media?.thumb)
                     Button(store.isSaved(epItem.id) ? "Remove Episode" : "Save Episode") { store.toggleSave(epItem) }
                 }
@@ -694,10 +743,14 @@ struct SavedView: View {
                         empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
                     }
                     ForEach(items) { s in
-                        Row(image: s.image, title: s.title, subtitle: s.subtitle, active: false)
-                            // ponytail: opens nts.live; archive audio is SoundCloud/Mixcloud, in-app playback needs a hidden WKWebView embed
-                            .onTapGesture { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + s.id)!) }
-                            .contextMenu { if tab != .history { Button(tab == .hosts ? "Unfollow Show" : "Remove Episode") { store.toggleSave(s) } } }
+                        let web = URL(string: "https://www.nts.live" + s.id)!
+                        Row(image: s.image, title: s.title, subtitle: s.subtitle, active: store.playingID == s.id)
+                            // episodes play in-app; hosts open their nts.live show page
+                            .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { NSWorkspace.shared.open(web) } }
+                            .contextMenu {
+                                Button("Open on nts.live") { NSWorkspace.shared.open(web) }
+                                if tab != .history { Button(tab == .hosts ? "Unfollow Show" : "Remove Episode") { store.toggleSave(s) } }
+                            }
                             .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
                         Rule()
                     }
@@ -761,6 +814,8 @@ struct NowPlayingView: View {
             ChannelNowView(channel: c)
         } else if let id = store.playingID, let m = store.mixtapes.first(where: { $0.id == id }) {
             MixtapeNowView(mixtape: m)
+        } else if let e = store.episode, e.id == store.playingID {
+            EpisodeNowView(id: e.id, d: e.details)
         } else {
             VStack(spacing: 12) {
                 Triangle().frame(width: 30, height: 30).opacity(0.3)
@@ -820,6 +875,112 @@ struct SectionLabel: View {
     }
 }
 
+/// Genre tags, description and the current/next track (live and archive episode pages).
+struct EpisodeInfo: View {
+    let details: Details?, tracks: [Track]?, current: Int?, openTracklist: () -> Void
+    var body: some View {
+        // Tag + description sizes measured from the NTS iPhone episode page (×0.896 for 360pt)
+        if let genres = details?.genres, !genres.isEmpty {
+            HStack(spacing: 7) {
+                ForEach(genres.prefix(4), id: \.value) {
+                    Text($0.value.nts).font(.nts(10)).opacity(0.85)
+                        .padding(.horizontal, 9).frame(height: 29)
+                        .overlay(Rectangle().strokeBorder(.white.opacity(0.33), lineWidth: 1))
+                }
+            }
+            .padding(.horizontal, pageInset).padding(.top, 12)
+        }
+        if let desc = details?.description, !desc.isEmpty {
+            Text(desc).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, pageInset).padding(.top, 13)
+        }
+        if let tracks, !tracks.isEmpty {
+            SectionLabel(text: "Playing now")
+            Button(action: openTracklist) {
+                VStack(spacing: 0) {
+                    if let current { TrackRow(track: tracks[current], state: .now) }
+                    let next = (current ?? -1) + 1
+                    if next < tracks.count { TrackRow(track: tracks[next], state: .next) }
+                }
+                .overlay(alignment: .trailing) {
+                    Image(systemName: "chevron.right").font(.nts(15)).opacity(0.6).padding(.trailing, pageInset)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+/// An archive episode playing in-app: like the live page, plus pause and a scrubber.
+struct EpisodeNowView: View {
+    @Environment(Store.self) var store
+    let id: String, d: Details
+    @State private var showTracklist = false
+    @State private var drag: Double?   // 0…1 while scrubbing
+
+    var path: String { String(id.dropFirst()) }
+
+    var body: some View {
+        let tracks = store.tracklists[path]
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let pos = store.position, dur = store.duration
+            let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
+            if showTracklist, let tracks {
+                TracklistView(tracks: tracks, current: current) { showTracklist = false }
+            } else {
+                FitScroll {
+                    VStack(alignment: .leading, spacing: 0) {
+                        let date = d.broadcastDate ?? .now
+                        NowHeader(image: d.media?.wide, title: d.name ?? "") {
+                            Text([d.locationLong, date.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year())]
+                                .compactMap { $0 }.joined(separator: " · ").nts).font(.nts(12.4, .regular))
+                        } accessory: {
+                            SaveMenu(details: d, title: d.name ?? "", date: date, size: 15)
+                        }
+                        HStack(spacing: 12) {
+                            Button { Task { await store.playEpisode(id) } } label: {
+                                Group {
+                                    if store.paused { Triangle().frame(width: 16, height: 18) }
+                                    else { HStack(spacing: 4) { Rectangle().frame(width: 5); Rectangle().frame(width: 5) }.frame(width: 16, height: 18) }
+                                }
+                                .frame(width: 20, height: 24).contentShape(.rect)
+                            }
+                            .buttonStyle(.plain)
+                            GeometryReader { g in
+                                let f = drag ?? (dur > 0 ? pos / dur : 0)
+                                ZStack(alignment: .leading) {
+                                    Rectangle().fill(.white.opacity(0.3)).frame(height: 2)
+                                    Rectangle().fill(.white).frame(width: g.size.width * f, height: 2)
+                                    Circle().fill(.white).frame(width: 10, height: 10).offset(x: g.size.width * f - 5)
+                                }
+                                .frame(maxHeight: .infinity).contentShape(.rect)
+                                .gesture(DragGesture(minimumDistance: 0)
+                                    .onChanged { drag = min(1, max(0, $0.location.x / g.size.width)) }
+                                    // ponytail: the thumb can flick back for a beat until the seek lands
+                                    .onEnded { _ in if let drag, dur > 0 { store.seek(drag * dur) }; drag = nil })
+                            }
+                            .frame(height: 24)
+                        }
+                        .padding(.horizontal, pageInset).padding(.top, 10)
+                        HStack {
+                            Text(clock(drag.map { $0 * dur } ?? pos))
+                            Spacer()
+                            Text("-" + clock(dur - (drag.map { $0 * dur } ?? pos))).opacity(0.6)
+                        }
+                        .font(.nts(10.5, .regular)).padding(.leading, pageInset + 32).padding(.trailing, pageInset)
+                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
+                        Spacer(minLength: 20)
+                    }
+                }
+            }
+        }
+        .task(id: path) { await store.loadTracklist(path) }
+    }
+
+    func clock(_ s: Double) -> String { Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
+}
+
 struct ChannelNowView: View {
     @Environment(Store.self) var store
     let channel: Channel
@@ -840,7 +1001,7 @@ struct ChannelNowView: View {
                         NowHeader(image: d?.media?.wide, title: b.title) {
                             ChannelBadge(channel: channel.channelName, location: d?.locationLong ?? "")
                         } accessory: {
-                            SaveMenu(channel: channel, size: 15)
+                            SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
                         }
                         HStack {
                             Text("\(hhmm(b.startTimestamp)) - \(hhmm(end))".nts)
@@ -848,37 +1009,7 @@ struct ChannelNowView: View {
                             Text("\(Int(end.timeIntervalSince(ctx.date) / 60)) MIN LEFT".nts).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        // Tag + description sizes measured from the NTS iPhone episode page (×0.896 for 360pt)
-                        if let genres = d?.genres, !genres.isEmpty {
-                            HStack(spacing: 7) {
-                                ForEach(genres.prefix(4), id: \.value) {
-                                    Text($0.value.nts).font(.nts(10)).opacity(0.85)
-                                        .padding(.horizontal, 9).frame(height: 29)
-                                        .overlay(Rectangle().strokeBorder(.white.opacity(0.33), lineWidth: 1))
-                                }
-                            }
-                            .padding(.horizontal, pageInset).padding(.top, 12)
-                        }
-                        if let desc = d?.description, !desc.isEmpty {
-                            Text(desc).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
-                                .padding(.horizontal, pageInset).padding(.top, 13)
-                        }
-
-                        if let tracks, !tracks.isEmpty {
-                            SectionLabel(text: "Playing now")
-                            Button { showTracklist = true } label: {
-                                VStack(spacing: 0) {
-                                    if let current { TrackRow(track: tracks[current], state: .now) }
-                                    let next = (current ?? -1) + 1
-                                    if next < tracks.count { TrackRow(track: tracks[next], state: .next) }
-                                }
-                                .overlay(alignment: .trailing) {
-                                    Image(systemName: "chevron.right").font(.nts(15)).opacity(0.6).padding(.trailing, pageInset)
-                                }
-                                .contentShape(.rect)
-                            }
-                            .buttonStyle(.plain)
-                        }
+                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
 
                         if let next = channel.next {
                             Rule().padding(.horizontal, pageInset).padding(.top, 18)
