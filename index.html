@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NTS</title>
+<style>
+  :root { --bg:#0b0b0b; --fg:#eee; --dim:#888; --line:#222; --hi:#fff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 -apple-system,system-ui,sans-serif; padding-bottom:110px; }
+  header { position:sticky; top:0; background:var(--bg); border-bottom:1px solid var(--line); display:flex; gap:12px; padding:12px 20px; z-index:2; }
+  header input { flex:1; max-width:420px; background:#151515; border:1px solid var(--line); color:var(--fg); padding:8px 12px; border-radius:6px; font:inherit; }
+  main { padding:20px; max-width:1200px; margin:auto; }
+  h2 { font-size:12px; letter-spacing:.1em; text-transform:uppercase; color:var(--dim); margin:28px 0 12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:16px; }
+  .live { grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); }
+  .card { cursor:pointer; background:none; border:0; color:inherit; text-align:left; padding:0; font:inherit; }
+  .card img { width:100%; aspect-ratio:1; object-fit:cover; display:block; border-radius:6px; background:#151515; }
+  .live .card img { aspect-ratio:16/9; }
+  .card b { display:block; margin-top:8px; }
+  .live small { white-space:pre-line; }
+  .card small, .meta { color:var(--dim); font-size:12px; }
+  .card:hover b, .card:focus-visible b { text-decoration:underline; }
+  .row { display:flex; gap:12px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
+  .row img { width:56px; height:56px; object-fit:cover; border-radius:4px; }
+  .row .card { flex:1; display:flex; gap:12px; align-items:center; }
+  .row .card b { margin:0; }
+  .link { background:none; border:0; color:var(--dim); cursor:pointer; font:inherit; padding:0; text-decoration:underline; }
+  #player { position:fixed; left:0; right:0; bottom:0; background:#111; border-top:1px solid var(--line); padding:10px 20px; display:none; gap:16px; align-items:center; }
+  #player.on { display:flex; }
+  #player img { width:56px; height:56px; object-fit:cover; border-radius:4px; }
+  #player .info { flex:1; min-width:0; }
+  #player .info b, #player .info small { display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #player iframe { flex:2; height:60px; border:0; }
+  #toggle { width:44px; height:44px; border-radius:50%; border:0; background:var(--hi); color:#000; font-size:16px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <button class="link" onclick="home()">Home</button>
+  <input id="q" type="search" placeholder="Search shows & episodes" onkeydown="if(event.key==='Enter')search(this.value)">
+</header>
+<main id="main"></main>
+<div id="player">
+  <img id="pimg" alt="">
+  <div class="info"><b id="ptitle"></b><small id="psub"></small></div>
+  <button id="toggle" aria-label="Play/pause" onclick="toggle()">❚❚</button>
+  <iframe id="embed" allow="autoplay" hidden></iframe>
+</div>
+<audio id="audio"></audio>
+<script>
+const API = 'https://www.nts.live/api/v2';
+// ponytail: undocumented endpoints the nts.live site itself uses; CORS is open so no proxy needed
+const LIVE_STREAMS = { 1: 'https://stream-relay-geo.ntslive.net/stream', 2: 'https://stream-relay-geo.ntslive.net/stream2' };
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`);
+const get = p => fetch(API + p).then(r => r.ok ? r.json() : Promise.reject(r.status));
+const time = t => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+let liveTimer;
+
+function card(img, title, sub, onclick) {
+  return `<button class="card" onclick='${esc(onclick)}'><img loading="lazy" src="${esc(img)}" alt=""><b>${esc(title)}</b><small>${esc(sub)}</small></button>`;
+}
+
+async function home() {
+  history.replaceState(null, '', '#');
+  const [live, mix] = await Promise.all([get('/live'), get('/mixtapes')]);
+  const liveHtml = live.results.map(c => {
+    const d = c.now.embeds?.details ?? {};
+    const next = c.next?.broadcast_title ? `Next ${time(c.next.start_timestamp)}: ${c.next.broadcast_title}` : '';
+    window['live' + c.channel_name] = { src: LIVE_STREAMS[c.channel_name], title: `NTS ${c.channel_name} · ${c.now.broadcast_title}`, sub: d.location_long ?? '', img: d.media?.picture_medium_large };
+    return card(d.media?.background_medium_large, `${c.channel_name} — ${c.now.broadcast_title}`,
+      `${time(c.now.start_timestamp)}–${time(c.now.end_timestamp)} · ${d.location_long ?? ''}\n${next}`, `play(live${c.channel_name})`);
+  }).join('');
+  window.mixtapes = Object.fromEntries(mix.results.map(m => [m.mixtape_alias,
+    { src: m.audio_stream_endpoint, title: m.title, sub: 'Infinite Mixtape', img: m.media.picture_large }]));
+  $('main').innerHTML = `<h2>Live</h2><div class="grid live">${liveHtml}</div>
+    <h2>Infinite Mixtapes</h2><div class="grid">${mix.results.map(m =>
+      card(m.media.picture_medium ?? m.media.picture_large, m.title, m.subtitle, `play(mixtapes[${JSON.stringify(m.mixtape_alias)}])`)).join('')}</div>`;
+  clearTimeout(liveTimer);
+  liveTimer = setTimeout(() => location.hash === '' && home(), 60_000);
+}
+
+function episodeRow(ep) {
+  window.eps ??= {};
+  window.eps[ep.key] = ep;
+  return `<div class="row"><button class="card" onclick='playEpisode(eps[${JSON.stringify(ep.key)}])'><img loading="lazy" src="${esc(ep.img)}" alt="">
+    <span><b>${esc(ep.title)}</b><small>${esc(ep.sub)}</small></span></button>
+    ${ep.show ? `<button class="link" onclick='show(${JSON.stringify(ep.show)})'>Show</button>` : ''}</div>`;
+}
+
+async function search(q) {
+  if (!q.trim()) return home();
+  const h = '#search/' + encodeURIComponent(q); if (location.hash !== h) history.pushState(null, '', h);
+  const r = await get(`/search?q=${encodeURIComponent(q)}&version=2&offset=0&limit=60&types[]=episode&types[]=show`);
+  const shows = r.results.filter(x => x.article_type === 'show');
+  const eps = r.results.filter(x => x.article_type === 'episode');
+  $('main').innerHTML =
+    (shows.length ? `<h2>Shows</h2><div class="grid">${shows.map(s =>
+      card(s.image?.medium ?? s.image?.large, s.title, s.location ?? '', `show(${JSON.stringify(s.article.path.split('/')[2])})`)).join('')}</div>` : '') +
+    `<h2>Episodes</h2>${eps.map(e => episodeRow({
+      key: e.article.path, title: e.title, sub: `${e.local_date} · ${e.location ?? ''}`, img: e.image?.small ?? e.image?.medium,
+      show: e.article.path.split('/')[2], sources: e.audio_sources })).join('') || '<p class="meta">Nothing found.</p>'}`;
+}
+
+async function show(alias, offset = 0) {
+  if (location.hash !== '#show/' + alias) history.pushState(null, '', '#show/' + alias);
+  const [s, r] = await Promise.all([get(`/shows/${alias}`), get(`/shows/${alias}/episodes?offset=${offset}&limit=50`)]);
+  const rows = r.results.map(e => episodeRow({
+    key: e.show_alias + '/' + e.episode_alias, title: e.name,
+    sub: `${new Date(e.broadcast).toLocaleDateString()} · ${(e.genres ?? []).map(g => g.value).join(', ')}`,
+    img: e.media?.picture_small, sources: [...(e.audio_sources ?? []), ...(e.mixcloud ? [{ source: 'mixcloud', url: e.mixcloud }] : [])] })).join('');
+  const more = r.metadata.resultset.count > offset + 50;
+  if (offset) return $('more')?.remove(), $('eps').insertAdjacentHTML('beforeend', rows + moreBtn(more, alias, offset));
+  $('main').innerHTML = `<h2>${esc(s.location_long ?? '')}</h2><h1>${esc(s.name)}</h1><div class="meta">${s.description_html ?? ''}</div>
+    <h2>Episodes (${r.metadata.resultset.count})</h2><div id="eps">${rows}${moreBtn(more, alias, offset)}</div>`;
+}
+const moreBtn = (more, alias, offset) => more ? `<p id="more"><button class="link" onclick='show(${JSON.stringify(alias)}, ${offset + 50})'>Load more</button></p>` : '';
+
+function setNowPlaying({ title, sub, img }) {
+  $('player').classList.add('on');
+  $('pimg').src = img ?? ''; $('ptitle').textContent = title; $('psub').textContent = sub ?? '';
+  if ('mediaSession' in navigator) navigator.mediaSession.metadata = new MediaMetadata({ title, artist: sub, artwork: img ? [{ src: img }] : [] });
+}
+
+function play(item) {
+  $('embed').hidden = true; $('embed').src = 'about:blank'; $('toggle').hidden = false;
+  $('audio').src = item.src; $('audio').play();
+  setNowPlaying(item);
+}
+
+function playEpisode(ep) {
+  // Archive audio lives on SoundCloud/Mixcloud, so use their embed widgets.
+  const sc = ep.sources?.find(s => s.source === 'soundcloud');
+  const mc = ep.sources?.find(s => s.source === 'mixcloud');
+  if (!sc && !mc) return alert('No playable audio for this episode.');
+  $('audio').pause(); $('toggle').hidden = true; $('embed').hidden = false;
+  $('embed').src = sc
+    ? `https://w.soundcloud.com/player/?url=${encodeURIComponent(sc.url)}&auto_play=true&visual=false&show_artwork=false&color=%23ffffff`
+    : `https://player-widget.mixcloud.com/widget/iframe/?feed=${encodeURIComponent(new URL(mc.url).pathname)}&autoplay=1&mini=1&hide_cover=1&light=0`;
+  setNowPlaying(ep);
+}
+
+function toggle() { const a = $('audio'); a.paused ? a.play() : a.pause(); }
+$('audio').onplay = () => $('toggle').textContent = '❚❚';
+$('audio').onpause = () => $('toggle').textContent = '▶';
+document.addEventListener('keydown', e => { if (e.code === 'Space' && e.target === document.body && !$('toggle').hidden) { e.preventDefault(); toggle(); } });
+
+function route() {
+  const [kind, arg] = location.hash.slice(1).split('/');
+  if (kind === 'show') show(arg);
+  else if (kind === 'search') { $('q').value = decodeURIComponent(arg); search($('q').value); }
+  else home();
+}
+window.onpopstate = route;
+route();
+</script>
+</body>
+</html>
