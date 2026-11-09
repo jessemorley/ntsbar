@@ -564,10 +564,11 @@ struct RootView: View {
     @State var page = Page.live
     @State private var barHover = false
 
-    /// The divider doubles as the playing live show's progress bar; solid otherwise.
+    /// The divider doubles as the progress bar: live show or archive episode; solid for mixtapes, grey when idle.
     func progress(at now: Date) -> Double {
         if store.seekable { return store.scrub ?? store.position / store.duration }
-        guard let id = store.playingID, let c = store.live.first(where: { $0.id == id }) else { return 1 }
+        guard let id = store.playingID else { return 0 }   // nothing playing: all inactive grey
+        guard let c = store.live.first(where: { $0.id == id }) else { return 1 }   // mixtapes: solid
         return fraction(c.now, at: now)
     }
 
