@@ -250,6 +250,37 @@ enum Keychain {
     func loadTracklist(_ episodePath: String) async {
         guard tracklists[episodePath] == nil else { return }
         tracklists[episodePath] = (try? await fetch(episodePath + "/tracklist")) ?? []
+        await checkTracks(tracklists[episodePath] ?? [])
+    }
+
+    var savedTracks: Set<String> = []   // track uids saved to the account
+
+    /// Which of these tracks are saved, as nts.live's tracklists ask (getMyTracksEurope with trackUids).
+    func checkTracks(_ tracks: [Track]) async {
+        let uids = tracks.compactMap(\.uid)
+        guard email != nil, !uids.isEmpty else { return }
+        do {
+            let r = (try await post("\(functions)/getMyTracksEurope", ["data": ["trackUids": uids]], token: token().token) as? [String: Any])?["result"] as? [String: Any]
+            for t in r?["results"] as? [[String: Any]] ?? [] { if let u = t["track_uid"] as? String { savedTracks.insert(u) } }
+        } catch { report(error) }
+    }
+
+    /// Save or remove a track (createMyTrackEurope / deleteMyTrackEurope), optimistic with rollback.
+    func toggleTrack(_ t: Track, episode: String) {
+        guard let uid = t.uid else { return }
+        let was = savedTracks.contains(uid)
+        if was { savedTracks.remove(uid) } else { savedTracks.insert(uid) }
+        let (show, ep) = aliases(episode)
+        Task {
+            do {
+                let (fn, args): (String, [String: Any]) = was ? ("deleteMyTrackEurope", ["trackUid": uid])
+                    : ("createMyTrackEurope", ["artistNames": [t.artist ?? ""], "episodeAlias": ep, "showAlias": show, "songTitle": t.title ?? "", "trackUid": uid])
+                _ = try await post("\(functions)/\(fn)", ["data": args], token: token().token)
+            } catch {
+                if was { savedTracks.insert(uid) } else { savedTracks.remove(uid) }
+                report(error)
+            }
+        }
     }
 
     func isSaved(_ id: String) -> Bool {
@@ -344,7 +375,7 @@ enum Keychain {
 
     func signOut() {
         Keychain.refreshToken = nil
-        session = nil; email = nil; feeds = [:]; problem = nil; followed = [:]; deviceIDs = []
+        session = nil; email = nil; feeds = [:]; problem = nil; followed = [:]; deviceIDs = []; savedTracks = []
         UserDefaults.standard.removeObject(forKey: "email")
     }
 
@@ -949,19 +980,21 @@ struct EpisodeInfo: View {
                 .padding(.horizontal, pageInset).padding(.top, 13)
         }
         if let tracks, !tracks.isEmpty {
-            SectionLabel(text: "Playing now")
+            Rule().padding(.horizontal, pageInset).padding(.top, 18)
             Button(action: openTracklist) {
-                VStack(spacing: 0) {
-                    if let current { TrackRow(track: tracks[current], state: .now) }
-                    let next = (current ?? -1) + 1
-                    if next < tracks.count { TrackRow(track: tracks[next], state: .next) }
-                }
-                .overlay(alignment: .trailing) {
-                    Image(systemName: "chevron.right").font(.nts(15)).opacity(0.6).padding(.trailing, pageInset)
-                }
-                .contentShape(.rect)
+                SectionLabel(text: "Playing now", dim: false).padding(.top, -6)
+                    .overlay(alignment: .trailing) {
+                        Image(systemName: "chevron.right").font(.nts(13)).opacity(0.6).padding(.trailing, pageInset).padding(.top, 10)
+                    }
+                    .contentShape(.rect)
             }
             .buttonStyle(.plain)
+            // always three rows (previous, current, next; the first three before the first track starts):
+            // the menu bar window doesn't grow while open, so the section mustn't change height
+            let start = max(0, min((current ?? 0) - 1, tracks.count - 3))
+            ForEach(start..<min(start + 3, tracks.count), id: \.self) { i in
+                TrackRow(track: tracks[i], state: i == current ? .now : i < (current ?? -1) ? .past : .next, episode: details?.episodePath)
+            }
         }
     }
 }
@@ -980,7 +1013,7 @@ struct EpisodeNowView: View {
             let pos = store.position, dur = store.duration
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
             if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current) { showTracklist = false }
+                TracklistView(tracks: tracks, current: current, episode: path) { showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1030,7 +1063,7 @@ struct ChannelNowView: View {
             let elapsed = ctx.date.timeIntervalSince(b.startTimestamp)
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= elapsed }
             if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current) { showTracklist = false }
+                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1110,7 +1143,7 @@ struct FitScroll<Content: View>: View {
 }
 
 struct TracklistView: View {
-    let tracks: [Track], current: Int?, back: () -> Void
+    let tracks: [Track], current: Int?, episode: String?, back: () -> Void
     var body: some View {
         VStack(spacing: 0) {
             Button(action: back) {
@@ -1128,7 +1161,7 @@ struct TracklistView: View {
                     LazyVStack(spacing: 0) {
                         // tracks repeat with the same uid (e.g. a jingle played twice), so key rows by position
                         ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
-                            TrackRow(track: t, state: current == i ? .now : (current ?? -1) > i ? .past : .next)
+                            TrackRow(track: t, state: current == i ? .now : (current ?? -1) > i ? .past : .next, episode: episode)
                         }
                     }
                     .padding(.vertical, 6)
@@ -1139,19 +1172,45 @@ struct TracklistView: View {
     }
 }
 
+/// ⋯ menu on a track: save to the account (signed in), copy, search on Spotify.
+struct TrackMenu: View {
+    @Environment(Store.self) var store
+    let track: Track, episode: String?
+    var body: some View {
+        let text = [track.artist, track.title].compactMap { $0 }.joined(separator: " - ")
+        Menu {
+            if store.email != nil, let uid = track.uid, let episode {
+                Button(store.savedTracks.contains(uid) ? "Remove Track" : "Save Track") { store.toggleTrack(track, episode: episode) }
+            }
+            Button("Copy") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }
+            Button("Search on Spotify") {
+                // the Spotify app if installed, else the web player
+                let q = text.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? text
+                let app = URL(string: "spotify:search:\(q)")!
+                NSWorkspace.shared.open(NSWorkspace.shared.urlForApplication(toOpen: app) != nil ? app : URL(string: "https://open.spotify.com/search/\(q)")!)
+            }
+        } label: {
+            Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 20, height: 16)
+        }
+        .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+    }
+}
+
 struct TrackRow: View {
     enum State { case past, now, next }
     let track: Track, state: State
+    var episode: String?   // shows/x/episodes/y, for saving the track
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
             Circle().fill(.red).frame(width: 6, height: 6).padding(.top, 6).opacity(state == .now ? 1 : 0)
             VStack(alignment: .leading, spacing: 1) {
-                Text((track.artist ?? "").nts).font(.nts(15)).lineLimit(1)
+                Text((track.artist ?? "").nts).font(.nts(12)).lineLimit(1)
                 Text(track.title ?? "").font(.system(size: 12)).opacity(0.75).lineLimit(1)
             }
             Spacer()
+            TrackMenu(track: track, episode: episode).padding(.top, 2)
         }
-        .padding(.horizontal, pageInset).padding(.vertical, 5)
+        .padding(.horizontal, pageInset).padding(.vertical, 9)
         .background(state == .now ? Color.white.opacity(0.08) : .clear)
         .opacity(state == .past ? 0.4 : 1)
     }
