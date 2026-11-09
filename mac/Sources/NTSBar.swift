@@ -85,7 +85,7 @@ extension Saved {
         let show = a["show_alias"] as? String ?? "", ep = a["episode_alias"] as? String ?? ""
         id = ep.isEmpty ? "/shows/\(show)" : "/shows/\(show)/episodes/\(ep)"
         title = (a["name"] as? String ?? show).htmlDecoded
-        subtitle = [a["location_long"], a["broadcast_datestr"]].compactMap { $0 as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
+        subtitle = a[ep.isEmpty ? "location_long" : "broadcast_datestr"] as? String ?? ""   // episodes: date only, as on iPhone
         image = ((a["image"] as? [String: Any])?["thumb"] as? String).flatMap(URL.init)
     }
 }
@@ -517,8 +517,9 @@ struct Row: View {
         HStack(spacing: 12) {
             Cover(url: image).frame(width: 52, height: 52)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title.nts).font(.nts(18)).lineLimit(1)
-                Text(subtitle).font(.system(size: 12)).opacity(0.6).lineLimit(2)
+                // sizes from the iPhone My NTS list (×0.896): bold title, regular uppercase date
+                Text(title.nts).font(.nts(14)).lineLimit(2)
+                Text(subtitle.nts).font(.nts(11, .regular)).lineLimit(1)
             }
             Spacer()
             if active { Circle().fill(.red).frame(width: 8, height: 8) }
