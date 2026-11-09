@@ -366,7 +366,7 @@ enum Keychain {
             let d = c.now.embeds?.details
             title = c.now.title; artist = ["NTS \(id)", d?.locationLong].compactMap { $0 }.joined(separator: " · "); media = d?.media
         } else if let m = mixtapes.first(where: { $0.id == id }) {
-            title = mixtapeNow?.title ?? m.title; artist = mixtapeNow == nil ? "NTS Infinite Mixtape" : "\(m.title) · NTS Infinite Mixtape"; media = m.media
+            title = m.title; artist = [mixtapeNow?.title, "NTS Infinite Mixtape"].compactMap { $0 }.joined(separator: " · "); media = m.media
         }
         var info: [String: Any] = [MPMediaItemPropertyTitle: title, MPMediaItemPropertyArtist: artist,
                                    MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : 1.0,
