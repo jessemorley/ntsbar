@@ -207,12 +207,16 @@ enum Keychain {
             }
         }
         Task { mixtapes = (try? await fetch("mixtapes")) ?? [] }
+        Task {
+            for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
+        }
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
     func toggle(_ id: String, _ url: String) {
-        if playingID == id { if paused { pauseResume() } else { player.pause(); playingID = nil }; return }
+        if playingID == id { if paused { pauseResume() } else { listenStop(); player.pause(); playingID = nil }; return }
         guard let u = URL(string: url) else { return }
+        listenStop()
         streamURL = u
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
@@ -224,8 +228,8 @@ enum Keychain {
 
     /// Archive episodes resume where they paused; live streams and mixtapes reload at the live edge.
     func pauseResume() {
-        if !paused { player.pause() }
-        else if episode?.id == playingID { player.play() }
+        if !paused { listenStop(); player.pause() }
+        else if episode?.id == playingID { player.play(); paused = false; listenStart(); return }
         else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
         paused.toggle()
     }
@@ -239,6 +243,7 @@ enum Keychain {
             let hls = try await resolveStream(source)
             episode = (id, d)
             toggle(id, hls.absoluteString)
+            listenStart()
             problem = nil
         } catch { report(error) }
     }
@@ -322,14 +327,9 @@ enum Keychain {
                     }
                 } else {
                     let (show, ep) = aliases(item.id)
-                    // nts.live's writeFavourite: createDocWithSession + the favourite fields
-                    let fields: [String: Any] = [
-                        "show_alias": str(show), "episode_alias": str(ep),
-                        "created_at": ["timestampValue": Date.now.ISO8601Format()],
-                        "device_id": str(uid), "client": str("NTSWebApp"),
-                        "session": ["mapValue": ["fields": ["firebase_user_uid": str(uid), "installation_id": ["nullValue": NSNull()]]]],
-                    ]
-                    _ = try await post("\(firestore)/favourites", ["fields": fields], token: t)
+                    // nts.live's writeFavourite
+                    try await createDoc("favourites", ["show_alias": str(show), "episode_alias": str(ep),
+                                                       "created_at": ["timestampValue": Date.now.ISO8601Format()]], token: t, uid: uid)
                 }
                 problem = nil
             } catch {
@@ -346,6 +346,50 @@ enum Keychain {
             do { followed[id] = try await !favouriteDocs(id, limit: 1).isEmpty }
             catch { report(error); return }
         }
+    }
+
+    /// nts.live's createDocWithSession: the fields plus device_id and a minimal session, added to a collection.
+    private func createDoc(_ collection: String, _ fields: [String: Any], token t: String, uid: String) async throws {
+        let session: [String: Any] = ["device_id": str(uid), "client": str("NTSWebApp"),
+                                      "session": ["mapValue": ["fields": ["firebase_user_uid": str(uid), "installation_id": ["nullValue": NSNull()]]]]]
+        _ = try await post("\(firestore)/\(collection)", ["fields": fields.merging(session) { a, _ in a }], token: t)
+    }
+
+    // MARK: Archive listens, written like nts.live's writeArchivePlayStart/Stop; History is built from them.
+    @ObservationIgnored private var listen: (id: String, started: Date)?
+
+    private func playFields(_ id: String, playedAt: Date, listened: Int, position: Double, length: Double) -> [String: Any] {
+        let (show, ep) = aliases(id)
+        func int(_ n: Int) -> [String: Any] { ["integerValue": String(n)] }
+        return ["show_alias": str(show), "episode_alias": str(ep),
+                "played_at": ["timestampValue": playedAt.ISO8601Format()], "updated_at": ["timestampValue": Date.now.ISO8601Format()],
+                "duration_s": int(listened), "current_position_s": int(Int(position)), "episode_duration_s": int(Int(length))]
+    }
+
+    /// Playback of an archive episode started or resumed.
+    private func listenStart() {
+        guard email != nil, listen == nil, let id = playingID, episode?.id == id,
+              !CommandLine.arguments.contains("--snapshot") else { return }   // renders don't write listens
+        listen = (id, .now)
+        let f = playFields(id, playedAt: .now, listened: 0, position: position, length: 0)
+        Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays_start", f, token: t, uid: uid) } catch { report(error) } }
+    }
+
+    /// Paused, switched away, finished or quitting: records the listen. Reads the position now, before the item changes.
+    @discardableResult func listenStop() -> Task<Void, Never>? {
+        guard let l = listen else { return nil }
+        listen = nil
+        let secs = Int(Date.now.timeIntervalSince(l.started).rounded(.up))
+        let f = playFields(l.id, playedAt: l.started, listened: secs, position: position, length: duration)
+        return Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays", f, token: t, uid: uid) } catch { report(error) } }
+    }
+
+    /// An archive episode reached its end: show play, back at the start.
+    private func ended() {
+        guard episode?.id == playingID, !paused else { return }
+        listenStop()
+        paused = true
+        player.seek(to: .zero)
     }
 
     private func aliases(_ id: String) -> (show: String, episode: String) {
@@ -865,7 +909,7 @@ struct SavedView: View {
                     Button("SIGN OUT".nts) { store.signOut() }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
                 }
                 Spacer()
-                Button("QUIT") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
+                Button("QUIT") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
             }
             .padding(10)
         }
