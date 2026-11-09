@@ -16,7 +16,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleName</key><string>NTS</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>27.0</string>
 </dict></plist>
 PLIST
 echo "Built $(pwd)/NTSBar.app"

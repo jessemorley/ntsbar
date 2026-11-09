@@ -154,9 +154,9 @@ struct Popover: View {
     var body: some View {
         RootView(page: page)
             .frame(width: 360)
-            .background(.black)
             .foregroundStyle(.white)
             .preferredColorScheme(.dark)
+            .background(.black)   // the window clips to its own native radius
     }
 }
 
@@ -164,7 +164,8 @@ struct Popover: View {
 @MainActor func snapshot(_ store: Store, to path: String, page: Page) {
     Task { @MainActor in
         try? await Task.sleep(for: .seconds(1))
-        let view = NSHostingView(rootView: Popover(page: page).environment(store))
+        let view = NSHostingView(rootView: Popover(page: page).environment(store)
+            .background(.black))
         let win = NSWindow(contentRect: .init(x: -3000, y: 0, width: 360, height: 800),
                            styleMask: .borderless, backing: .buffered, defer: false)
         win.contentView = view
