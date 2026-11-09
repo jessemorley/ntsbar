@@ -371,9 +371,9 @@ enum Keychain {
                 }
                 let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
                 let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
-                let seen = Set(feeds[tab]?.items.map(\.id) ?? [])
+                var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
                 let items = (r["results"] as? [[String: Any]] ?? []).compactMap { $0["article"] as? [String: Any] }
-                    .map(Saved.init(article:)).filter { !seen.contains($0.id) }
+                    .map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
                 feeds[tab]?.items += items
                 feeds[tab]?.cursor = meta[next]
                 feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
@@ -658,20 +658,43 @@ struct SaveMenu: View {
 // MARK: - Mixtapes / Saved
 
 struct Row: View {
-    let image: URL?, title: String, subtitle: String, active: Bool
+    /// Episodes are playable: a play overlay on hover; the current one keeps pause (or play while paused).
+    enum Playback { case none, playable, playing, paused }
+    let image: URL?, title: String, subtitle: String
+    var playback = Playback.none
+    @State private var hovering = false
     var body: some View {
+        let icon = playback == .playing || playback == .paused || (playback == .playable && hovering)
         HStack(spacing: 12) {
             Cover(url: image).frame(width: 52, height: 52)
+                .overlay {
+                    if icon {
+                        Color.black.opacity(0.3)
+                        Group {
+                            if playback == .playing { PauseIcon() } else { Triangle() }
+                        }
+                        .frame(width: 14, height: 16).shadow(color: .black.opacity(0.35), radius: 3)
+                    }
+                }
             VStack(alignment: .leading, spacing: 2) {
                 // sizes from the iPhone My NTS list (×0.896): bold title, regular uppercase date
                 Text(title.nts).font(.nts(14)).lineLimit(2)
                 Text(subtitle.nts).font(.nts(11, .regular)).lineLimit(1)
             }
             Spacer()
-            if active { Circle().fill(.red).frame(width: 8, height: 8) }
         }
         .padding(.horizontal, 9).padding(.vertical, 8)
         .contentShape(.rect)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// Two bars, sized by the frame it's given.
+struct PauseIcon: View {
+    var body: some View {
+        GeometryReader { g in
+            HStack(spacing: g.size.width * 0.25) { Rectangle(); Rectangle() }
+        }
     }
 }
 
@@ -751,7 +774,8 @@ struct SavedView: View {
                     }
                     ForEach(items) { s in
                         let web = URL(string: "https://www.nts.live" + s.id)!
-                        Row(image: s.image, title: s.title, subtitle: s.subtitle, active: store.playingID == s.id)
+                        Row(image: s.image, title: s.title, subtitle: s.subtitle,
+                            playback: !s.isEpisode ? .none : store.playingID != s.id ? .playable : store.paused ? .paused : .playing)
                             // episodes play in-app; hosts open their nts.live show page
                             .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { NSWorkspace.shared.open(web) } }
                             .contextMenu {
@@ -949,7 +973,7 @@ struct EpisodeNowView: View {
                             Button { Task { await store.playEpisode(id) } } label: {
                                 Group {
                                     if store.paused { Triangle().frame(width: 16, height: 18) }
-                                    else { HStack(spacing: 4) { Rectangle().frame(width: 5); Rectangle().frame(width: 5) }.frame(width: 16, height: 18) }
+                                    else { PauseIcon().frame(width: 16, height: 18) }
                                 }
                                 .frame(width: 20, height: 24).contentShape(.rect)
                             }
