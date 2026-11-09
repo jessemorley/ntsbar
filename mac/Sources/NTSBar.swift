@@ -213,7 +213,7 @@ struct Cover: View {
 
 // Layout measured from the NTS iPhone app (402pt wide), scaled to our 360pt popover.
 let cardHeight: CGFloat = 326
-let contentHeight = cardHeight * 2 + 1
+let contentHeight = cardHeight * 2
 let pageInset: CGFloat = 14   // page margin below artwork (16pt on iPhone)
 
 func hhmm(_ d: Date) -> String {
@@ -244,16 +244,6 @@ struct RootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Group {
-                switch page {
-                case .live: LiveView()
-                case .nowPlaying: NowPlayingView()
-                case .mixtapes: MixtapesView()
-                case .saved: SavedView()
-                }
-            }
-            .frame(height: contentHeight, alignment: .top)
-            Rule()
             HStack(spacing: 0) {
                 ForEach(Page.allCases, id: \.self) { p in
                     Button { page = p } label: {
@@ -267,6 +257,16 @@ struct RootView: View {
                     .buttonStyle(.plain)
                 }
             }
+            Rectangle().fill(.white).frame(height: 1)
+            Group {
+                switch page {
+                case .live: LiveView()
+                case .nowPlaying: NowPlayingView()
+                case .mixtapes: MixtapesView()
+                case .saved: SavedView()
+                }
+            }
+            .frame(height: contentHeight, alignment: .top)
         }
     }
 }
@@ -280,7 +280,6 @@ struct LiveView: View {
         VStack(spacing: 0) {
             if let e = store.error { Text(e.uppercased()).font(.nts(14)).opacity(0.6).padding() }
             ForEach(Array(store.live.enumerated()), id: \.element.id) { i, c in
-                if i > 0 { Rectangle().fill(.white.opacity(0.6)).frame(height: 1) }
                 ChannelCard(channel: c)
             }
             if store.live.isEmpty && store.error == nil { ProgressView().frame(maxHeight: .infinity) }
