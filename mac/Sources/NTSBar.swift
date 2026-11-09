@@ -1085,6 +1085,7 @@ struct NowPlayingView: View {
 struct NowHeader<Badge: View, Accessory: View>: View {
     let image: URL?, title: String
     var video: URL? = nil
+    var titleSize: CGFloat = 16
     @ViewBuilder let badge: Badge
     @ViewBuilder let accessory: Accessory
     var body: some View {
@@ -1099,7 +1100,7 @@ struct NowHeader<Badge: View, Accessory: View>: View {
                 }
             badge.padding(.horizontal, pageInset).padding(.top, 16)
             HStack(alignment: .top, spacing: 16) {
-                Text(title.nts).font(.nts(16)).fixedSize(horizontal: false, vertical: true)
+                Text(title.nts).font(.nts(titleSize)).fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
                 accessory.padding(.trailing, 5)
             }
@@ -1414,14 +1415,13 @@ struct MixtapeNowView: View {
     var body: some View {
         FitScroll {
             VStack(alignment: .leading, spacing: 0) {
-                NowHeader(image: mixtape.media?.wide, title: mixtape.title, video: mixtape.media?.animationThumb.flatMap(URL.init)) {
-                    HStack(spacing: 7) {
-                        Circle().fill(.red).frame(width: 5, height: 5)
-                        Text("INFINITE MIXTAPE".nts).font(.nts(12.4, .regular))
-                    }
+                NowHeader(image: mixtape.media?.wide, title: mixtape.title, video: mixtape.media?.animationThumb.flatMap(URL.init), titleSize: 22) {
+                    AsyncImage(url: mixtape.media?.iconWhite.flatMap(URL.init)) { $0.resizable().interpolation(.high).antialiased(true).scaledToFit() } placeholder: { Color.clear }
+                        .frame(width: 26, height: 26)
                 } accessory: { EmptyView() }
                 .overlay(alignment: .top) { PlayOverlay() }
-                Text(mixtape.subtitle).font(.system(size: 13, weight: .semibold)).padding(.horizontal, pageInset).padding(.top, 12)
+                Text(mixtape.subtitle).font(.nts(12))   // sentence case, unlike .nts
+                    .padding(.horizontal, pageInset).padding(.top, 12)
                 if let desc = mixtape.description {
                     Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 6)
                 }
