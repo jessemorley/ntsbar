@@ -109,7 +109,10 @@ extension Saved {
         let show = a["show_alias"] as? String ?? "", ep = a["episode_alias"] as? String ?? ""
         id = ep.isEmpty ? "/shows/\(show)" : "/shows/\(show)/episodes/\(ep)"
         title = (a["name"] as? String ?? show).htmlDecoded
-        subtitle = a[ep.isEmpty ? "location_long" : "broadcast_datestr"] as? String ?? ""   // episodes: date only, as on iPhone
+        if ep.isEmpty {   // shows: "Last episode 3 days ago" (the feed is already ordered by it)
+            let last = ((a["latest_episode"] as? [String: Any])?["broadcast_date"] as? String).flatMap { try? Date($0, strategy: .iso8601) }
+            subtitle = last.map { "Last episode " + $0.formatted(.relative(presentation: .named)) } ?? ""
+        } else { subtitle = a["broadcast_datestr"] as? String ?? "" }   // episodes: date only, as on iPhone
         image = ((a["image"] as? [String: Any])?["thumb"] as? String).flatMap(URL.init)
     }
 }
@@ -929,7 +932,12 @@ struct Row: View {
             VStack(alignment: .leading, spacing: 2) {
                 // sizes from the iPhone My NTS list (×0.896): bold title, regular uppercase date
                 Text(title.nts).font(.nts(14)).lineLimit(2)
-                Text(subtitle.nts).font(.nts(11, .regular)).lineLimit(1)
+                if subtitle.hasPrefix("Last episode ") {   // hosts: grey, only the age bold
+                    (Text("Last episode ".nts) + Text(String(subtitle.dropFirst(13)).nts).font(.nts(11)))
+                        .font(.nts(11, .regular)).opacity(0.6).lineLimit(1)
+                } else {
+                    Text(subtitle.nts).font(.nts(11, .regular)).lineLimit(1)
+                }
             }
             Spacer()
         }
