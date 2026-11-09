@@ -22,7 +22,7 @@ struct Details: Decodable {
 struct Broadcast: Decodable {
     var broadcastTitle: String, startTimestamp: Date, endTimestamp: Date?
     // API titles carry HTML entities (e.g. &amp;)
-    var title: String { broadcastTitle.replacing("&amp;", with: "&").replacing("&#39;", with: "'").replacing("&quot;", with: "\"") }
+    var title: String { broadcastTitle.htmlDecoded }
     var embeds: Embeds?
     struct Embeds: Decodable { var details: Details? }
 }
@@ -79,6 +79,70 @@ struct Saved: Codable, Identifiable, Hashable {
     var isEpisode: Bool { id.contains("/episodes/") }
 }
 
+extension Saved {
+    /// From the `article` of a My NTS Cloud Function result (a show, or an episode when episode_alias is set).
+    init(article a: [String: Any]) {
+        let show = a["show_alias"] as? String ?? "", ep = a["episode_alias"] as? String ?? ""
+        id = ep.isEmpty ? "/shows/\(show)" : "/shows/\(show)/episodes/\(ep)"
+        title = (a["name"] as? String ?? show).htmlDecoded
+        subtitle = [a["location_long"], a["broadcast_datestr"]].compactMap { $0 as? String }.filter { !$0.isEmpty }.joined(separator: " · ")
+        image = ((a["image"] as? [String: Any])?["thumb"] as? String).flatMap(URL.init)
+    }
+}
+
+enum SavedTab: String, CaseIterable { case hosts, episodes, history }
+
+/// One lazily paged list from the account.
+struct Feed { var items: [Saved] = [], cursor: Any? = nil, done = false, loading = false }
+
+// MARK: - NTS account
+// nts.live signs in with Firebase Auth (project nts-ios-app) and reads My NTS through callable
+// Cloud Functions. Both are called over REST with the site's public web key; no Firebase SDK.
+
+let firebaseKey = "AIzaSyA4Qp5AvHC8Rev72-10-_DY614w_bxUCJU"
+let functions = "https://europe-west2-nts-ios-app.cloudfunctions.net"   // nts.live's _functions() region
+
+struct APIError: LocalizedError { var errorDescription: String? }
+
+/// POST JSON and return the decoded reply. Google APIs report failures as {"error":{…}}
+/// (runQuery wraps it in an array), so surface that message verbatim.
+@MainActor func post(_ url: String, _ body: [String: Any], token: String? = nil) async throws -> Any {
+    var r = URLRequest(url: URL(string: url)!)
+    r.httpMethod = "POST"
+    r.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    if let token { r.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    r.httpBody = try JSONSerialization.data(withJSONObject: body)
+    let (data, _) = try await URLSession.shared.data(for: r)
+    let json = try JSONSerialization.jsonObject(with: data)
+    let err = (json as? [String: Any])?["error"] ?? (json as? [[String: Any]])?.first?["error"]
+    if let e = err as? [String: Any] { throw APIError(errorDescription: (e["status"].map { "\($0): " } ?? "") + "\(e["message"] ?? e)") }
+    return json
+}
+
+/// The refresh token lives in the Keychain; it's the long-lived credential.
+enum Keychain {
+    static var query: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: "com.jessemorley.ntsbar",
+         kSecAttrAccount as String: "nts-refresh-token"]
+    }
+    static var refreshToken: String? {
+        get {
+            var q = query, out: AnyObject?
+            q[kSecReturnData as String] = true
+            guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+            return String(data: d, encoding: .utf8)
+        }
+        set {
+            SecItemDelete(query as CFDictionary)
+            guard let newValue else { return }
+            var q = query
+            q[kSecValueData as String] = Data(newValue.utf8)
+            SecItemAdd(q as CFDictionary, nil)
+        }
+    }
+}
+
+
 @Observable @MainActor final class Store {
     var live: [Channel] = []
     var mixtapes: [Mixtape] = []
@@ -90,6 +154,11 @@ struct Saved: Codable, Identifiable, Hashable {
         didSet { UserDefaults.standard.set(try? JSONEncoder().encode(saved), forKey: "saved") }
     }
     private let player = AVPlayer()
+
+    var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
+    var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
+    var accountError: String?
+    @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
 
     init() {
         Task {
@@ -121,6 +190,65 @@ struct Saved: Codable, Identifiable, Hashable {
     func toggleSave(_ item: Saved) {
         if isSaved(item.id) { saved.removeAll { $0.id == item.id } } else { saved.insert(item, at: 0) }
     }
+
+    func signIn(_ email: String, _ password: String) async {
+        do {
+            let r = try await post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=\(firebaseKey)",
+                                   ["email": email, "password": password, "returnSecureToken": true]) as? [String: Any] ?? [:]
+            guard let token = r["idToken"] as? String, let uid = r["localId"] as? String else { throw APIError(errorDescription: "Unexpected sign-in reply") }
+            Keychain.refreshToken = r["refreshToken"] as? String
+            session = (token, uid, .now + 3000)   // ID tokens last an hour
+            self.email = email
+            UserDefaults.standard.set(email, forKey: "email")
+            accountError = nil
+            feeds = [:]
+        } catch { accountError = error.localizedDescription }
+    }
+
+    func signOut() {
+        Keychain.refreshToken = nil
+        session = nil; email = nil; feeds = [:]; accountError = nil
+        UserDefaults.standard.removeObject(forKey: "email")
+    }
+
+    /// A valid ID token, refreshed from the Keychain's refresh token when expired.
+    private func token() async throws -> (token: String, uid: String) {
+        if let s = session, s.expires > .now { return (s.token, s.uid) }
+        guard let refresh = Keychain.refreshToken else { throw APIError(errorDescription: "Signed out, sign in again") }
+        let r = try await post("https://securetoken.googleapis.com/v1/token?key=\(firebaseKey)",
+                               ["grant_type": "refresh_token", "refresh_token": refresh]) as? [String: Any] ?? [:]
+        guard let t = r["id_token"] as? String, let uid = r["user_id"] as? String else { throw APIError(errorDescription: "Unexpected token reply") }
+        Keychain.refreshToken = r["refresh_token"] as? String ?? refresh
+        session = (t, uid, .now + 3000)
+        return (t, uid)
+    }
+
+    /// Next page of hosts or episodes, from the callable functions nts.live's My NTS pages use.
+    func loadMore(_ tab: SavedTab) async {
+        guard email != nil, tab != .history, feeds[tab]?.done != true, feeds[tab]?.loading != true else { return }
+        feeds[tab, default: Feed()].loading = true
+        defer { feeds[tab]?.loading = false }
+        do {
+            let t = try await token().token
+            var added = 0
+            repeat {   // the site re-asks when a page is empty but not final
+                let cursor = feeds[tab]?.cursor ?? NSNull()
+                let (fn, args, next): (String, [String: Any], String) = tab == .hosts
+                    ? ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
+                    : ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
+                let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
+                let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
+                let seen = Set(feeds[tab]?.items.map(\.id) ?? [])
+                let items = (r["results"] as? [[String: Any]] ?? []).compactMap { $0["article"] as? [String: Any] }
+                    .map(Saved.init(article:)).filter { !seen.contains($0.id) }
+                feeds[tab]?.items += items
+                feeds[tab]?.cursor = meta[next]
+                feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
+                added = items.count
+            } while added == 0 && feeds[tab]?.done == false
+            accountError = nil
+        } catch { accountError = error.localizedDescription }
+    }
 }
 
 // MARK: - App
@@ -135,7 +263,7 @@ struct Saved: Codable, Identifiable, Hashable {
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
             // --playing <id> fakes what's playing (no audio); --tab now/mixtapes opens that page
             if let j = args.firstIndex(of: "--playing"), j + 1 < args.count { s.playingID = args[j + 1] }
-            snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : args.contains("mixtapes") ? .mixtapes : .live)
+            snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : args.contains("mixtapes") ? .mixtapes : args.contains("saved") ? .saved : .live)
         }
     }
 
@@ -223,6 +351,8 @@ func hhmm(_ d: Date) -> String {
 }
 
 extension String {
+    /// API titles carry HTML entities (e.g. &amp;).
+    var htmlDecoded: String { replacing("&amp;", with: "&").replacing("&#39;", with: "'").replacing("&quot;", with: "\"") }
     /// Uppercased, with U+2005 spaces: Univers Condensed kerns the plain space against W and "-",
     /// shrinking gaps ("SHOWW/", "18:00- 20:00"); CoreText applies those pairs even with kerning 0.
     var nts: String { uppercased().replacing(" ", with: "\u{2005}") }
@@ -442,34 +572,96 @@ struct MixtapeTile: View {
 
 struct SavedView: View {
     @Environment(Store.self) var store
+    @State private var tab = SavedTab.hosts
+
+    /// Signed in: the account's lists, paged in. Signed out: the local saves.
+    var items: [Saved] {
+        if store.email != nil { return store.feeds[tab]?.items ?? [] }
+        return tab == .history ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if store.saved.isEmpty {
-                        Text("NOTHING SAVED YET".nts).font(.nts(16)).opacity(0.5)
-                            .frame(maxWidth: .infinity).padding(.top, 60)
+            HStack(spacing: 0) {
+                ForEach(SavedTab.allCases, id: \.self) { t in
+                    Button { tab = t } label: {
+                        Text(t.rawValue.nts).font(.nts(14))
+                            .frame(maxWidth: .infinity, minHeight: 36).contentShape(.rect)
+                            .opacity(tab == t ? 1 : 0.45)
                     }
-                    section("SHOWS", store.saved.filter { !$0.isEpisode })
-                    section("EPISODES", store.saved.filter(\.isEpisode))
+                    .buttonStyle(.plain)
                 }
             }
-            Button("QUIT") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
-                .frame(maxWidth: .infinity, alignment: .trailing).padding(10)
+            Rule()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if store.email == nil { AccountView() }
+                    if let err = store.accountError {
+                        Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
+                            .padding(.horizontal, 9).padding(.top, 8)
+                    }
+                    let loading = store.feeds[tab]?.loading == true
+                    if tab == .history {
+                        empty("HISTORY COMING SOON")
+                    } else if items.isEmpty && !loading {
+                        empty("NOTHING SAVED YET")
+                    }
+                    ForEach(items) { s in
+                        Row(image: s.image, title: s.title, subtitle: s.subtitle, active: false)
+                            // ponytail: opens nts.live; archive audio is SoundCloud/Mixcloud, in-app playback needs a hidden WKWebView embed
+                            .onTapGesture { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + s.id)!) }
+                            .contextMenu { if store.email == nil { Button("Remove") { store.toggleSave(s) } } }
+                            .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
+                        Rule()
+                    }
+                    if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                }
+            }
+            .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
+            HStack {
+                if let e = store.email {
+                    Text(e).font(.system(size: 11)).opacity(0.5).lineLimit(1)
+                    Button("SIGN OUT".nts) { store.signOut() }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
+                }
+                Spacer()
+                Button("QUIT") { NSApp.terminate(nil) }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
+            }
+            .padding(10)
         }
     }
 
-    @ViewBuilder func section(_ title: String, _ items: [Saved]) -> some View {
-        if !items.isEmpty {
-            Text(title).font(.nts(14)).opacity(0.5).padding(.horizontal, 9).padding(.top, 14).padding(.bottom, 4)
-            ForEach(items) { s in
-                Row(image: s.image, title: s.title, subtitle: s.subtitle, active: false)
-                    // ponytail: opens nts.live; archive audio is SoundCloud/Mixcloud, in-app playback needs a hidden WKWebView embed
-                    .onTapGesture { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + s.id)!) }
-                    .contextMenu { Button("Remove") { store.toggleSave(s) } }
-                Rule()
+    func empty(_ text: String) -> some View {
+        Text(text.nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
+    }
+}
+
+/// Sign-in form, shown above the local list while signed out.
+struct AccountView: View {
+    @Environment(Store.self) var store
+    @State private var email = ""
+    @State private var password = ""
+    @State private var open = false
+    @State private var busy = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if open {
+                TextField("Email", text: $email).textContentType(.username)
+                SecureField("Password", text: $password).textContentType(.password).onSubmit(submit)
+                Button((busy ? "SIGNING IN…" : "SIGN IN").nts, action: submit).font(.nts(14))
+                    .disabled(busy || email.isEmpty || password.isEmpty)
+            } else {
+                Button("SIGN IN TO NTS".nts) { open = true }.buttonStyle(.plain).font(.nts(14))
             }
         }
+        .textFieldStyle(.roundedBorder)
+        .padding(.horizontal, 9).padding(.top, 12)
+    }
+
+    func submit() {
+        guard !busy else { return }
+        busy = true
+        Task { await store.signIn(email, password); password = ""; busy = false }
     }
 }
 
