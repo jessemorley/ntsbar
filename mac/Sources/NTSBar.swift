@@ -55,10 +55,9 @@ struct Track: Decodable, Identifiable {
     var uid: String?, artist: String?, title: String?, offset: Int?, duration: Int?
     var id: String { uid ?? "" }   // uid can be null; lists key rows by position anyway
 }
-struct Credit: Decodable { var name: String, path: String }
 struct Mixtape: Decodable, Identifiable {
     var mixtapeAlias: String, title: String, subtitle: String, audioStreamEndpoint: String, media: Media?
-    var description: String?, credits: [Credit]?
+    var description: String?
     var id: String { mixtapeAlias }
 }
 struct Results<T: Decodable>: Decodable { var results: [T] }
@@ -151,6 +150,19 @@ struct APIError: LocalizedError { var errorDescription: String? }
     return json
 }
 
+/// The episode a mixtape is playing now, as nts.live's footer player reads it (Firestore `mixtape_titles`).
+/// Returns its title and nts.live path (/shows/x[/episodes/y]).
+@MainActor func mixtapeTitle(_ alias: String) async throws -> (title: String, path: String?)? {
+    let q: [String: Any] = ["from": [["collectionId": "mixtape_titles"]], "where": filter("mixtape_alias", "EQUAL", str(alias)),
+                            "orderBy": [["field": ["fieldPath": "started_at"], "direction": "DESCENDING"]], "limit": 1]
+    let r = try await post("\(firestore):runQuery?key=\(firebaseKey)", ["structuredQuery": q]) as? [[String: Any]] ?? []
+    guard let f = (r.first?["document"] as? [String: Any])?["fields"] as? [String: Any] else { return nil }
+    func v(_ k: String) -> String { (f[k] as? [String: Any])?["stringValue"] as? String ?? "" }
+    guard !v("title").isEmpty else { return nil }
+    let show = v("show_alias"), ep = v("episode_alias")
+    return (v("title"), show.isEmpty ? nil : "/shows/\(show)" + (ep.isEmpty ? "" : "/episodes/\(ep)"))
+}
+
 /// The refresh token lives in the Keychain; it's the long-lived credential.
 enum Keychain {
     static var query: [String: Any] {
@@ -179,6 +191,7 @@ enum Keychain {
     var live: [Channel] = []
     var mixtapes: [Mixtape] = []
     var playingID: String?
+    var mixtapeNow: (title: String, path: String?)?   // the episode the playing mixtape is on
     var error: String?
     var tracklists: [String: [Track]] = [:]   // by episode path
     var saved: [Saved] = (UserDefaults.standard.data(forKey: "saved"))
@@ -207,7 +220,11 @@ enum Keychain {
                 try? await Task.sleep(for: .seconds(min(60, ends.min() ?? 60)))
             }
         }
-        Task { mixtapes = (try? await fetch("mixtapes")) ?? [] }
+        Task { mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow() }
+        Task {
+            // ponytail: polls every 30s; nts.live uses a Firestore onSnapshot listener, switch if the lag shows
+            while true { await refreshMixtapeNow(); try? await Task.sleep(for: .seconds(30)) }
+        }
         Task {
             for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
         }
@@ -225,9 +242,16 @@ enum Keychain {
         player.play()
         playingID = id
         paused = false
+        mixtapeNow = nil
+        Task { await refreshMixtapeNow() }
     }
 
     @ObservationIgnored private var streamURL: URL?
+
+    func refreshMixtapeNow() async {
+        guard let id = playingID, mixtapes.contains(where: { $0.id == id }), let t = try? await mixtapeTitle(id), id == playingID else { return }
+        if t.title != mixtapeNow?.title { mixtapeNow = t; nowPlaying() }
+    }
 
     func stop() {
         listenStop(); player.pause(); playingID = nil
@@ -327,7 +351,7 @@ enum Keychain {
             let d = c.now.embeds?.details
             title = c.now.title; artist = ["NTS \(id)", d?.locationLong].compactMap { $0 }.joined(separator: " · "); media = d?.media
         } else if let m = mixtapes.first(where: { $0.id == id }) {
-            title = m.title; artist = "NTS Infinite Mixtape"; media = m.media
+            title = mixtapeNow?.title ?? m.title; artist = mixtapeNow == nil ? "NTS Infinite Mixtape" : "\(m.title) · NTS Infinite Mixtape"; media = m.media
         }
         var info: [String: Any] = [MPMediaItemPropertyTitle: title, MPMediaItemPropertyArtist: artist,
                                    MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : 1.0,
@@ -1276,25 +1300,25 @@ func fraction(_ b: Broadcast, at now: Date) -> Double {
 /// Muted, looping, aspect-filled video (the mixtapes' animated artwork).
 struct LoopingVideo: NSViewRepresentable {
     let url: URL
-    final class Host: NSView {
-        let player = AVQueuePlayer()
-        var looper: AVPlayerLooper?
-        override init(frame: NSRect) {
-            super.init(frame: frame)
-            let layer = AVPlayerLayer(player: player)
-            layer.videoGravity = .resizeAspectFill
-            self.layer = layer
-            wantsLayer = true
-            player.isMuted = true
+    // ponytail: one shared player outlives the view, so switching back to Now Playing shows frames
+    // straight away instead of the still while a fresh player buffers. Only one mixtape plays at a time.
+    @MainActor static let player: AVQueuePlayer = { let p = AVQueuePlayer(); p.isMuted = true; return p }()
+    @MainActor static var looper: AVPlayerLooper?
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        let layer = AVPlayerLayer(player: Self.player)
+        layer.videoGravity = .resizeAspectFill
+        v.layer = layer
+        v.wantsLayer = true
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {
+        if (Self.looper?.loopingPlayerItems.first?.asset as? AVURLAsset)?.url != url {
+            Self.looper = AVPlayerLooper(player: Self.player, templateItem: AVPlayerItem(url: url))
         }
-        required init?(coder: NSCoder) { nil }
+        Self.player.play()
     }
-    func makeNSView(context: Context) -> Host { Host() }
-    func updateNSView(_ v: Host, context: Context) {
-        guard (v.looper?.loopingPlayerItems.first?.asset as? AVURLAsset)?.url != url else { return }
-        v.looper = AVPlayerLooper(player: v.player, templateItem: AVPlayerItem(url: url))
-        v.player.play()
-    }
+    static func dismantleNSView(_ v: NSView, coordinator: ()) { player.pause() }
 }
 
 /// Content at its natural height, scrolling only once it outgrows the space offered.
@@ -1385,8 +1409,8 @@ struct TrackRow: View {
 }
 
 struct MixtapeNowView: View {
+    @Environment(Store.self) var store
     let mixtape: Mixtape
-    @State private var showCredits = false
     var body: some View {
         FitScroll {
             VStack(alignment: .leading, spacing: 0) {
@@ -1401,24 +1425,18 @@ struct MixtapeNowView: View {
                 if let desc = mixtape.description {
                     Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 6)
                 }
-                // ponytail: no public per-track feed for mixtapes (now_playing_topic is empty), so show the source shows
-                Rule().padding(.horizontal, pageInset).padding(.top, 18)
-                Button { showCredits.toggle() } label: {
-                    SectionLabel(text: "Credits", dim: false).padding(.top, -6)
-                        .overlay(alignment: .trailing) {
-                            Image(systemName: showCredits ? "chevron.up" : "chevron.down").font(.nts(13)).opacity(0.6)
-                                .padding(.trailing, pageInset).padding(.top, 4)
+                if store.playingID == mixtape.id, let now = store.mixtapeNow {
+                    Rule().padding(.horizontal, pageInset).padding(.top, 18)
+                    SectionLabel(text: "Playing now", dim: false).padding(.top, -6)
+                    Button { if let p = now.path { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + p)!) } } label: {
+                        HStack(spacing: 8) {
+                            Text(now.title.uppercased().nts).font(.nts(12)).frame(maxWidth: .infinity, alignment: .leading)
+                            if now.path != nil { Image(systemName: "arrow.up.right").font(.system(size: 11)).opacity(0.6) }
                         }
-                        .contentShape(.rect)
-                }
-                .buttonStyle(.plain)
-                if showCredits { ForEach(mixtape.credits ?? [], id: \.path) { c in
-                    Button { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + c.path)!) } label: {
-                        Text(c.name.nts).font(.nts(12)).frame(maxWidth: .infinity, alignment: .leading)   // same size as track names
-                            .padding(.horizontal, pageInset).padding(.vertical, 9).contentShape(.rect)
+                        .padding(.horizontal, pageInset).padding(.vertical, 9).contentShape(.rect)
                     }
                     .buttonStyle(.plain)
-                } }
+                }
                 Spacer(minLength: 20)
             }
         }
