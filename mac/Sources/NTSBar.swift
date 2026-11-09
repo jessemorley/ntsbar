@@ -8,7 +8,7 @@ let liveStreams = ["1": "https://stream-relay-geo.ntslive.net/stream",
                    "2": "https://stream-relay-geo.ntslive.net/stream2"]
 
 struct Media: Decodable {
-    var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?
+    var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?, animationThumb: String?
     var thumb: URL? { (pictureSmall ?? pictureMedium ?? pictureLarge).flatMap(URL.init) }
     var wide: URL? { (backgroundMediumLarge ?? pictureLarge).flatMap(URL.init) }
 }
@@ -241,7 +241,14 @@ enum Page: CaseIterable { case live, nowPlaying, mixtapes, saved
 }
 
 struct RootView: View {
+    @Environment(Store.self) var store
     @State var page = Page.live
+
+    /// The divider doubles as the playing live show's progress bar; solid otherwise.
+    func progress(at now: Date) -> Double {
+        guard let id = store.playingID, let c = store.live.first(where: { $0.id == id }) else { return 1 }
+        return fraction(c.now, at: now)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -259,7 +266,10 @@ struct RootView: View {
                 }
             }
             .padding(.bottom, 2)
-            Rectangle().fill(.white).frame(height: 1)
+            TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
+                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * progress(at: ctx.date)) }
+            }
             Group {
                 switch page {
                 case .live: LiveView()
@@ -484,14 +494,20 @@ struct NowPlayingView: View {
 
 /// Artwork with the show info below it, as on the NTS iPhone show page (sizes measured from it, ×0.896).
 struct NowHeader<Badge: View, Accessory: View>: View {
-    let image: URL?, title: String, progress: Double
+    let image: URL?, title: String
+    var video: URL? = nil
     @ViewBuilder let badge: Badge
     @ViewBuilder let accessory: Accessory
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Cover(url: image).frame(height: 221)
-            Rectangle().fill(.white.opacity(0.3)).frame(height: 2)
-                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: 360 * progress) }
+                .overlay {
+                    if let video {
+                        // fades into the page like the NTS iPhone mixtape page
+                        LoopingVideo(url: video)
+                            .overlay { LinearGradient(colors: [.clear, .black], startPoint: .init(x: 0.5, y: 0.35), endPoint: .bottom) }
+                    }
+                }
             badge.padding(.horizontal, pageInset).padding(.top, 16)
             HStack(alignment: .top, spacing: 16) {
                 Text(title.nts).font(.nts(16)).fixedSize(horizontal: false, vertical: true)
@@ -541,7 +557,7 @@ struct ChannelNowView: View {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let end = b.endTimestamp ?? ctx.date
-                        NowHeader(image: d?.media?.wide, title: b.title, progress: fraction(b, at: ctx.date)) {
+                        NowHeader(image: d?.media?.wide, title: b.title) {
                             ChannelBadge(channel: channel.channelName, location: d?.locationLong ?? "")
                         } accessory: {
                             SaveMenu(channel: channel, size: 15)
@@ -591,10 +607,34 @@ struct ChannelNowView: View {
         }
         .task(id: d?.episodePath) { if let p = d?.episodePath { await store.loadTracklist(p) } }
     }
+}
 
-    func fraction(_ b: Broadcast, at now: Date) -> Double {
-        let end = b.endTimestamp ?? now
-        return max(0, min(1, now.timeIntervalSince(b.startTimestamp) / max(1, end.timeIntervalSince(b.startTimestamp))))
+func fraction(_ b: Broadcast, at now: Date) -> Double {
+    let end = b.endTimestamp ?? now
+    return max(0, min(1, now.timeIntervalSince(b.startTimestamp) / max(1, end.timeIntervalSince(b.startTimestamp))))
+}
+
+/// Muted, looping, aspect-filled video (the mixtapes' animated artwork).
+struct LoopingVideo: NSViewRepresentable {
+    let url: URL
+    final class Host: NSView {
+        let player = AVQueuePlayer()
+        var looper: AVPlayerLooper?
+        override init(frame: NSRect) {
+            super.init(frame: frame)
+            let layer = AVPlayerLayer(player: player)
+            layer.videoGravity = .resizeAspectFill
+            self.layer = layer
+            wantsLayer = true
+            player.isMuted = true
+        }
+        required init?(coder: NSCoder) { nil }
+    }
+    func makeNSView(context: Context) -> Host { Host() }
+    func updateNSView(_ v: Host, context: Context) {
+        guard (v.looper?.loopingPlayerItems.first?.asset as? AVURLAsset)?.url != url else { return }
+        v.looper = AVPlayerLooper(player: v.player, templateItem: AVPlayerItem(url: url))
+        v.player.play()
     }
 }
 
@@ -661,10 +701,11 @@ struct TrackRow: View {
 
 struct MixtapeNowView: View {
     let mixtape: Mixtape
+    @State private var showCredits = false
     var body: some View {
         FitScroll {
             VStack(alignment: .leading, spacing: 0) {
-                NowHeader(image: mixtape.media?.wide, title: mixtape.title, progress: 1) {
+                NowHeader(image: mixtape.media?.wide, title: mixtape.title, video: mixtape.media?.animationThumb.flatMap(URL.init)) {
                     HStack(spacing: 7) {
                         Circle().fill(.red).frame(width: 5, height: 5)
                         Text("INFINITE MIXTAPE".nts).font(.nts(12.4, .regular))
@@ -675,14 +716,22 @@ struct MixtapeNowView: View {
                     Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 6)
                 }
                 // ponytail: no public per-track feed for mixtapes (now_playing_topic is empty), so show the source shows
-                SectionLabel(text: "Featuring shows from")
-                ForEach(mixtape.credits ?? [], id: \.path) { c in
+                Button { showCredits.toggle() } label: {
+                    SectionLabel(text: "Featuring shows from")
+                        .overlay(alignment: .trailing) {
+                            Image(systemName: showCredits ? "chevron.up" : "chevron.down").font(.nts(13)).opacity(0.5)
+                                .padding(.trailing, pageInset).padding(.top, 10)
+                        }
+                        .contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                if showCredits { ForEach(mixtape.credits ?? [], id: \.path) { c in
                     Button { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + c.path)!) } label: {
                         Text(c.name.nts).font(.nts(14)).frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, pageInset).padding(.vertical, 4).contentShape(.rect)
                     }
                     .buttonStyle(.plain)
-                }
+                } }
                 Spacer(minLength: 12)
             }
         }
