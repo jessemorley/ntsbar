@@ -840,8 +840,7 @@ struct ChannelCard: View {
         let playing = store.playingID == channel.id && !store.paused
         ZStack(alignment: .topLeading) {
             Cover(url: d?.media?.wide)
-            LinearGradient(stops: [.init(color: .black.opacity(0.35), location: 0), .init(color: .clear, location: 0.45)],
-                           startPoint: .top, endPoint: .bottom)
+            Color.black.opacity(0.2)   // NTS dims the artwork slightly; no shadows on text
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 5) {
                     Circle().fill(.red).frame(width: 5, height: 5)
@@ -871,7 +870,6 @@ struct ChannelCard: View {
                     SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp)
                 }
             }
-            .shadow(color: .black.opacity(0.35), radius: 3)
             .padding(.leading, 8).padding(.trailing, 10).padding(.top, 7).padding(.bottom, 9)
         }
         .frame(height: cardHeight)
@@ -925,7 +923,7 @@ struct Row: View {
                         Group {
                             if playback == .playing { PauseIcon() } else { Triangle() }
                         }
-                        .frame(width: 14, height: 16).shadow(color: .black.opacity(0.35), radius: 3)
+                        .frame(width: 14, height: 16)
                     }
                 }
             VStack(alignment: .leading, spacing: 2) {
@@ -976,7 +974,7 @@ struct MixtapeTile: View {
                         if playing { Rectangle().frame(width: 15, height: 15).padding(1) }
                         else { Triangle().frame(width: 17, height: 17) }
                     }
-                    .padding(10).shadow(color: .black.opacity(0.35), radius: 3)
+                    .padding(10)
                 }
                 .overlay(alignment: .bottomLeading) {
                     HStack(spacing: 6) {
@@ -984,7 +982,7 @@ struct MixtapeTile: View {
                             .frame(width: 13, height: 13)
                         Text(mixtape.title.nts).font(.nts(15)).lineLimit(1)
                     }
-                    .padding(10).shadow(color: .black.opacity(0.35), radius: 3)
+                    .padding(10)
                 }
                 .contentShape(.rect)
         }
@@ -1216,7 +1214,7 @@ struct PlayOverlay: View {
                 }
                 if skips { control("goforward.30") { store.skip(30) } }
             }
-            .buttonStyle(.plain).shadow(color: .black.opacity(0.35), radius: 3)
+            .buttonStyle(.plain)
         }
         .frame(height: 221)
     }
