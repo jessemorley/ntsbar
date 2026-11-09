@@ -8,7 +8,7 @@ let liveStreams = ["1": "https://stream-relay-geo.ntslive.net/stream",
                    "2": "https://stream-relay-geo.ntslive.net/stream2"]
 
 struct Media: Decodable {
-    var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?
+    var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?
     var thumb: URL? { (pictureSmall ?? pictureMedium ?? pictureLarge).flatMap(URL.init) }
     var wide: URL? { (backgroundMediumLarge ?? pictureLarge).flatMap(URL.init) }
 }
@@ -133,9 +133,9 @@ struct Saved: Codable, Identifiable, Hashable {
         _store = State(initialValue: s)
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--snapshot"), i + 1 < args.count {
-            // --playing <id> fakes what's playing (no audio); --tab now opens on Now Playing
+            // --playing <id> fakes what's playing (no audio); --tab now/mixtapes opens that page
             if let j = args.firstIndex(of: "--playing"), j + 1 < args.count { s.playingID = args[j + 1] }
-            snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : .live)
+            snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : args.contains("mixtapes") ? .mixtapes : .live)
         }
     }
 
@@ -392,14 +392,41 @@ struct MixtapesView: View {
     @Environment(Store.self) var store
     var body: some View {
         ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(store.mixtapes) { m in
-                    Row(image: m.media?.thumb, title: m.title, subtitle: m.subtitle, active: store.playingID == m.id)
-                        .onTapGesture { store.toggle(m.id, m.audioStreamEndpoint) }
-                    Rule()
-                }
+            LazyVGrid(columns: [GridItem(spacing: 1), GridItem()], spacing: 1) {
+                ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
+    }
+}
+
+/// Square tile styled after nts.live's infinite mixtapes grid: dimmed artwork, play top-left, icon + title bottom-left.
+struct MixtapeTile: View {
+    @Environment(Store.self) var store
+    let mixtape: Mixtape
+    var body: some View {
+        let playing = store.playingID == mixtape.id
+        Button { store.toggle(mixtape.id, mixtape.audioStreamEndpoint) } label: {
+            Color.clear.aspectRatio(1, contentMode: .fit)
+                .overlay { Cover(url: mixtape.media?.pictureMedium.flatMap(URL.init)) }
+                .overlay { Color.black.opacity(0.3) }
+                .overlay(alignment: .topLeading) {
+                    Group {
+                        if playing { Rectangle().frame(width: 15, height: 15).padding(1) }
+                        else { Triangle().frame(width: 17, height: 17) }
+                    }
+                    .padding(10).shadow(color: .black.opacity(0.35), radius: 3)
+                }
+                .overlay(alignment: .bottomLeading) {
+                    HStack(spacing: 6) {
+                        AsyncImage(url: mixtape.media?.iconWhite.flatMap(URL.init)) { $0.resizable().scaledToFit() } placeholder: { Color.clear }
+                            .frame(width: 13, height: 13)
+                        Text(mixtape.title.nts).font(.nts(15)).lineLimit(1)
+                    }
+                    .padding(10).shadow(color: .black.opacity(0.35), radius: 3)
+                }
+                .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
     }
 }
 
