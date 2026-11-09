@@ -1271,19 +1271,20 @@ struct MixtapeNowView: View {
                     Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 6)
                 }
                 // ponytail: no public per-track feed for mixtapes (now_playing_topic is empty), so show the source shows
+                Rule().padding(.horizontal, pageInset).padding(.top, 18)
                 Button { showCredits.toggle() } label: {
-                    SectionLabel(text: "Featuring shows from")
+                    SectionLabel(text: "Credits", dim: false).padding(.top, -6)
                         .overlay(alignment: .trailing) {
-                            Image(systemName: showCredits ? "chevron.up" : "chevron.down").font(.nts(13)).opacity(0.5)
-                                .padding(.trailing, pageInset).padding(.top, 10)
+                            Image(systemName: showCredits ? "chevron.up" : "chevron.down").font(.nts(13)).opacity(0.6)
+                                .padding(.trailing, pageInset).padding(.top, 4)
                         }
                         .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
                 if showCredits { ForEach(mixtape.credits ?? [], id: \.path) { c in
                     Button { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + c.path)!) } label: {
-                        Text(c.name.nts).font(.nts(14)).frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, pageInset).padding(.vertical, 4).contentShape(.rect)
+                        Text(c.name.nts).font(.nts(12)).frame(maxWidth: .infinity, alignment: .leading)   // same size as track names
+                            .padding(.horizontal, pageInset).padding(.vertical, 9).contentShape(.rect)
                     }
                     .buttonStyle(.plain)
                 } }
