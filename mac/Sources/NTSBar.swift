@@ -771,7 +771,7 @@ struct RootView: View {
             .padding(.bottom, 2)
             TimelineView(.periodic(from: .now, by: 1)) { ctx in
                 let f = progress(at: ctx.date)
-                Rectangle().fill(.white.opacity(0.3)).frame(height: 1)
+                Rectangle().fill(.white.opacity(store.loading ? 0.7 : 0.3)).frame(height: 1)   // loading: dimmer white under the shimmer
                     .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
                     .overlay { if store.loading { Shimmer() } }
                     .overlay(alignment: .leading) {   // archive episodes: a handle on hover, drag to seek
