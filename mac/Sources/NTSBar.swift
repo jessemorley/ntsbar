@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import MediaPlayer
 
 // MARK: - API (undocumented, same endpoints nts.live uses)
 
@@ -200,7 +201,7 @@ enum Keychain {
     init() {
         Task {
             while true {
-                do { live = try await fetch("live"); error = nil } catch { self.error = "Can't reach NTS" }
+                do { live = try await fetch("live"); error = nil; if liveStreams[playingID ?? ""] != nil { nowPlaying() } } catch { self.error = "Can't reach NTS" }
                 // poll every 60s, but also wake just after the earliest current show ends
                 let ends = live.compactMap(\.now.endTimestamp).map { $0.timeIntervalSinceNow + 5 }.filter { $0 > 0 }
                 try? await Task.sleep(for: .seconds(min(60, ends.min() ?? 60)))
@@ -210,11 +211,13 @@ enum Keychain {
         Task {
             for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
         }
+        if !CommandLine.arguments.contains("--snapshot") { remoteCommands() }
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
     func toggle(_ id: String, _ url: String) {
-        if playingID == id { if paused { pauseResume() } else { listenStop(); player.pause(); playingID = nil }; return }
+        defer { nowPlaying() }
+        if playingID == id { if paused { pauseResume() } else { stop() }; return }
         guard let u = URL(string: url) else { return }
         listenStop()
         streamURL = u
@@ -226,8 +229,14 @@ enum Keychain {
 
     @ObservationIgnored private var streamURL: URL?
 
+    func stop() {
+        listenStop(); player.pause(); playingID = nil
+        nowPlaying()
+    }
+
     /// Archive episodes resume where they paused; live streams and mixtapes reload at the live edge.
     func pauseResume() {
+        defer { nowPlaying() }
         if !paused { listenStop(); player.pause() }
         else if episode?.id == playingID { player.play(); paused = false; listenStart(); return }
         else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
@@ -244,6 +253,9 @@ enum Keychain {
             episode = (id, d)
             toggle(id, hls.absoluteString)
             listenStart()
+            if let item = player.currentItem {   // HLS duration arrives once the playlist loads
+                Task { for await _ in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values { nowPlaying() } }
+            }
             problem = nil
         } catch { report(error) }
     }
@@ -256,7 +268,8 @@ enum Keychain {
     }
 
     func skip(_ seconds: Double) {
-        player.seek(to: CMTime(seconds: min(max(0, position + seconds), duration), preferredTimescale: 600))
+        let t = CMTime(seconds: min(max(0, position + seconds), duration), preferredTimescale: 600)
+        Task { await player.seek(to: t); nowPlaying() }
     }
 
     var scrub: Double?   // 0…1 while dragging the tab divider over an archive episode
@@ -264,7 +277,79 @@ enum Keychain {
     /// Seeks to the dragged spot, holding the handle there until the seek lands.
     func endScrub() {
         guard let f = scrub else { return }
-        Task { await player.seek(to: CMTime(seconds: f * duration, preferredTimescale: 600)); scrub = nil }
+        Task { await player.seek(to: CMTime(seconds: f * duration, preferredTimescale: 600)); scrub = nil; nowPlaying() }
+    }
+
+    // MARK: Now Playing (Control Centre) and media keys / AirPods, routed through the in-app controls.
+    private func remoteCommands() {
+        let rc = MPRemoteCommandCenter.shared()
+        let on = Store.on
+        on(rc.playCommand) { [weak self] _ in if self?.paused == true { self?.pauseResume() } }
+        on(rc.pauseCommand) { [weak self] _ in if self?.playingID != nil, self?.paused == false { self?.pauseResume() } }
+        on(rc.togglePlayPauseCommand) { [weak self] _ in if self?.playingID != nil { self?.pauseResume() } }
+        on(rc.stopCommand) { [weak self] _ in self?.stop() }
+        rc.skipBackwardCommand.preferredIntervals = [30]
+        rc.skipForwardCommand.preferredIntervals = [30]
+        on(rc.skipBackwardCommand) { [weak self] _ in if self?.seekable == true { self?.skip(-30) } }
+        on(rc.skipForwardCommand) { [weak self] _ in if self?.seekable == true { self?.skip(30) } }
+        on(rc.changePlaybackPositionCommand) { [weak self] t in
+            guard let self, seekable else { return }
+            scrub = t / duration; endScrub()   // moves the in-app handle too
+        }
+    }
+
+    /// MediaPlayer may call handlers off the main thread, so the handler itself is nonisolated and hops over.
+    private nonisolated static func on(_ c: MPRemoteCommand, _ f: @escaping @MainActor @Sendable (Double) -> Void) {
+        c.addTarget { e in
+            let t = (e as? MPChangePlaybackPositionCommandEvent)?.positionTime ?? 0
+            Task { @MainActor in f(t) }
+            return .success
+        }
+    }
+
+    @ObservationIgnored private var artwork: (url: URL, art: MPMediaItemArtwork?)?
+    /// MediaPlayer calls the image handler off the main thread, so it must not inherit the Store's actor.
+    private nonisolated func makeArtwork(_ img: NSImage) -> MPMediaItemArtwork { MPMediaItemArtwork(boundsSize: img.size) { _ in img } }
+
+    /// Publishes what's playing to Control Centre. Called on play/pause/seek/skip/stop and when /live moves on.
+    func nowPlaying() {
+        guard !CommandLine.arguments.contains("--snapshot") else { return }
+        let center = MPNowPlayingInfoCenter.default(), rc = MPRemoteCommandCenter.shared()
+        let archive = playingID != nil && episode?.id == playingID
+        for c in [rc.skipBackwardCommand, rc.skipForwardCommand, rc.changePlaybackPositionCommand] { c.isEnabled = archive }
+        guard let id = playingID else { center.nowPlayingInfo = nil; center.playbackState = .stopped; return }
+
+        var title = "", artist = "", media: Media?
+        if archive, let d = episode?.details {
+            let date = (d.broadcastDate ?? .now).formatted(.dateTime.day(.twoDigits).month(.abbreviated).year())
+            title = d.name ?? ""; artist = "NTS · " + [d.locationLong, date].compactMap { $0 }.joined(separator: ", "); media = d.media
+        } else if let c = live.first(where: { $0.id == id }) {
+            let d = c.now.embeds?.details
+            title = c.now.title; artist = ["NTS \(id)", d?.locationLong].compactMap { $0 }.joined(separator: " · "); media = d?.media
+        } else if let m = mixtapes.first(where: { $0.id == id }) {
+            title = m.title; artist = "NTS Infinite Mixtape"; media = m.media
+        }
+        var info: [String: Any] = [MPMediaItemPropertyTitle: title, MPMediaItemPropertyArtist: artist,
+                                   MPNowPlayingInfoPropertyPlaybackRate: paused ? 0.0 : 1.0,
+                                   MPNowPlayingInfoPropertyIsLiveStream: !archive]
+        if archive {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        }
+        // NTS's image server crops to a centred square when the path says crop/ instead of resize/
+        let url = (media?.pictureLarge ?? media?.pictureMedium).flatMap { URL(string: $0.replacing(/resize\/\d+x\d+/, with: "crop/500x500")) }
+        if let url, artwork?.url == url { info[MPMediaItemPropertyArtwork] = artwork?.art }
+        else if let url {   // load once per item, then republish
+            artwork = (url, nil)
+            Task {
+                guard let (data, _) = try? await URLSession.shared.data(from: url), let img = NSImage(data: data),
+                      artwork?.url == url else { return }
+                artwork = (url, makeArtwork(img))
+                nowPlaying()
+            }
+        }
+        center.nowPlayingInfo = info
+        center.playbackState = paused ? .paused : .playing
     }
 
     func loadTracklist(_ episodePath: String) async {
@@ -390,6 +475,7 @@ enum Keychain {
         listenStop()
         paused = true
         player.seek(to: .zero)
+        nowPlaying()
     }
 
     private func aliases(_ id: String) -> (show: String, episode: String) {
