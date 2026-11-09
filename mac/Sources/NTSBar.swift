@@ -533,8 +533,9 @@ struct ChannelBadge: View {
 
 struct SectionLabel: View {
     let text: String
+    var dim = true
     var body: some View {
-        Text(text.nts).font(.nts(13)).opacity(0.5)
+        Text(text.nts).font(.nts(13)).opacity(dim ? 0.5 : 1)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, pageInset).padding(.top, 16).padding(.bottom, 6)
     }
@@ -600,7 +601,17 @@ struct ChannelNowView: View {
                             .buttonStyle(.plain)
                         }
 
-                        Spacer(minLength: 12)
+                        if let next = channel.next {
+                            Rule().padding(.horizontal, pageInset).padding(.top, 18)
+                            SectionLabel(text: "Next on \(channel.channelName)", dim: false).padding(.top, -6)
+                            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                                Text(hhmm(next.startTimestamp)).font(.nts(14, .regular)).opacity(0.6)
+                                Text(next.title.nts).font(.nts(14)).lineLimit(2)
+                            }
+                            .padding(.horizontal, pageInset)
+                        }
+
+                        Spacer(minLength: 20)
                     }
                 }
             }
@@ -732,7 +743,7 @@ struct MixtapeNowView: View {
                     }
                     .buttonStyle(.plain)
                 } }
-                Spacer(minLength: 12)
+                Spacer(minLength: 20)
             }
         }
     }
