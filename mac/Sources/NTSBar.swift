@@ -211,17 +211,28 @@ enum Keychain {
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
     func toggle(_ id: String, _ url: String) {
-        if playingID == id { player.pause(); playingID = nil; return }
+        if playingID == id { if paused { pauseResume() } else { player.pause(); playingID = nil }; return }
         guard let u = URL(string: url) else { return }
+        streamURL = u
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
         playingID = id
         paused = false
     }
 
+    @ObservationIgnored private var streamURL: URL?
+
+    /// Archive episodes resume where they paused; live streams and mixtapes reload at the live edge.
+    func pauseResume() {
+        if !paused { player.pause() }
+        else if episode?.id == playingID { player.play() }
+        else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
+        paused.toggle()
+    }
+
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
     func playEpisode(_ id: String) async {
-        if playingID == id { paused ? player.play() : player.pause(); paused.toggle(); return }
+        if playingID == id { pauseResume(); return }
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.audioSources?.first?.url ?? d.mixcloud else { throw APIError(errorDescription: "No audio for this episode") }
@@ -237,6 +248,10 @@ enum Keychain {
     func report(_ error: Error) {
         if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
         problem = error.localizedDescription
+    }
+
+    func skip(_ seconds: Double) {
+        player.seek(to: CMTime(seconds: min(max(0, position + seconds), duration), preferredTimescale: 600))
     }
 
     var scrub: Double?   // 0…1 while dragging the tab divider over an archive episode
@@ -639,7 +654,7 @@ struct ChannelCard: View {
 
     var body: some View {
         let d = channel.now.embeds?.details
-        let playing = store.playingID == channel.id
+        let playing = store.playingID == channel.id && !store.paused
         ZStack(alignment: .topLeading) {
             Cover(url: d?.media?.wide)
             LinearGradient(stops: [.init(color: .black.opacity(0.35), location: 0), .init(color: .clear, location: 0.45)],
@@ -747,7 +762,7 @@ struct Row: View {
 struct PauseIcon: View {
     var body: some View {
         GeometryReader { g in
-            HStack(spacing: g.size.width * 0.25) { Rectangle(); Rectangle() }
+            HStack(spacing: g.size.width / 3) { Rectangle(); Rectangle() }   // bars and gap in equal thirds, as on iPhone
         }
     }
 }
@@ -768,7 +783,7 @@ struct MixtapeTile: View {
     @Environment(Store.self) var store
     let mixtape: Mixtape
     var body: some View {
-        let playing = store.playingID == mixtape.id
+        let playing = store.playingID == mixtape.id && !store.paused
         Button { store.toggle(mixtape.id, mixtape.audioStreamEndpoint) } label: {
             Color.clear.aspectRatio(1, contentMode: .fit)
                 .overlay { Cover(url: mixtape.media?.pictureMedium.flatMap(URL.init)) }
@@ -999,6 +1014,34 @@ struct EpisodeInfo: View {
     }
 }
 
+/// Pause/play over the dimmed Now Playing artwork, as on the iPhone player (×0.896); ±30s for archive episodes.
+struct PlayOverlay: View {
+    @Environment(Store.self) var store
+    var skips = false
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.3)
+            HStack(spacing: 0) {
+                if skips { control("gobackward.30") { store.skip(-30) } }
+                Button { store.pauseResume() } label: {
+                    Group {
+                        if store.paused { Triangle().frame(width: 34, height: 39) }
+                        else { PauseIcon().frame(width: 34, height: 39) }
+                    }
+                    .frame(width: 80, height: 80).contentShape(.rect)
+                }
+                if skips { control("goforward.30") { store.skip(30) } }
+            }
+            .buttonStyle(.plain).shadow(color: .black.opacity(0.35), radius: 3)
+        }
+        .frame(height: 221)
+    }
+
+    func control(_ symbol: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) { Image(systemName: symbol).font(.system(size: 25, weight: .semibold)).frame(width: 80, height: 80).contentShape(.rect) }
+    }
+}
+
 /// An archive episode playing in-app: like the live page, plus pause and a scrubber.
 struct EpisodeNowView: View {
     @Environment(Store.self) var store
@@ -1024,21 +1067,14 @@ struct EpisodeNowView: View {
                         } accessory: {
                             SaveMenu(details: d, title: d.name ?? "", date: date, size: 15)
                         }
-                        HStack(spacing: 12) {
-                            Button { Task { await store.playEpisode(id) } } label: {
-                                Group {
-                                    if store.paused { Triangle().frame(width: 16, height: 18) }
-                                    else { PauseIcon().frame(width: 16, height: 18) }
-                                }
-                                .frame(width: 20, height: 24).contentShape(.rect)
-                            }
-                            .buttonStyle(.plain)
+                        .overlay(alignment: .top) { PlayOverlay(skips: true) }
+                        HStack {
                             let at = store.scrub.map { $0 * dur } ?? pos
                             Text(clock(at))
                             Spacer()
                             Text("-" + clock(dur - at)).opacity(0.6)
                         }
-                        .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 10)
+                        .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
                         EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
                         Spacer(minLength: 20)
                     }
@@ -1073,6 +1109,7 @@ struct ChannelNowView: View {
                         } accessory: {
                             SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
                         }
+                        .overlay(alignment: .top) { PlayOverlay() }
                         HStack {
                             Text("\(hhmm(b.startTimestamp)) - \(hhmm(end))".nts)
                             Spacer()
@@ -1228,6 +1265,7 @@ struct MixtapeNowView: View {
                         Text("INFINITE MIXTAPE".nts).font(.nts(12.4, .regular))
                     }
                 } accessory: { EmptyView() }
+                .overlay(alignment: .top) { PlayOverlay() }
                 Text(mixtape.subtitle).font(.system(size: 13, weight: .semibold)).padding(.horizontal, pageInset).padding(.top, 12)
                 if let desc = mixtape.description {
                     Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 6)
