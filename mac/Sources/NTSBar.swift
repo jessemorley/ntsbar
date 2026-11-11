@@ -757,6 +757,7 @@ struct RootView: View {
     @Environment(Store.self) var store
     @State var page = Page.live
     @State private var barHover = false
+    var mini: Bool { page != .nowPlaying && store.playingID != nil }
 
     /// The divider doubles as the progress bar: live show or archive episode; solid for mixtapes, grey when idle.
     func progress(at now: Date) -> Double {
@@ -816,8 +817,10 @@ struct RootView: View {
                 case .saved: SavedView()
                 }
             }
-            // Now Playing shrinks the window to its content; other pages keep the fixed height
-            .frame(minHeight: page == .nowPlaying ? nil : contentHeight, maxHeight: contentHeight, alignment: .top)
+            // Now Playing shrinks the window to its content; other pages keep the fixed height, the mini player taking its share
+            .frame(minHeight: page == .nowPlaying ? nil : contentHeight - (mini ? miniHeight : 0),
+                   maxHeight: contentHeight - (mini ? miniHeight : 0), alignment: .top)
+            if mini { MiniPlayer { page = .nowPlaying } }
         }
     }
 }
@@ -885,7 +888,7 @@ struct ChannelCard: View {
             }
             .padding(.leading, 8).padding(.trailing, 10).padding(.top, 7).padding(.bottom, 9)
         }
-        .frame(height: cardHeight)
+        .frame(minHeight: 0, maxHeight: cardHeight)   // shrinks to make room for the mini player
     }
 }
 
@@ -1311,6 +1314,56 @@ struct NowPlayingView: View {
     }
 }
 
+let miniHeight: CGFloat = 53   // iPhone mini player (59pt) ×0.896
+
+/// What's playing, under the page, as on the iPhone app: artwork, pause/play, title and times; tap to open Now Playing.
+struct MiniPlayer: View {
+    @Environment(Store.self) var store
+    let open: () -> Void
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let (image, title, subtitle) = info
+            HStack(spacing: 0) {
+                Cover(url: image).frame(width: miniHeight, height: miniHeight)
+                Button { store.pauseResume() } label: {
+                    Group {
+                        if store.loading { Spinner() } else if store.paused { Triangle() } else { PauseIcon() }
+                    }
+                    .frame(width: 17, height: 19).frame(width: 50, height: miniHeight).contentShape(.rect)
+                }
+                .buttonStyle(.plain)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title.nts).font(.nts(14)).lineLimit(1)
+                    Text(subtitle.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
+            }
+            .contentShape(.rect)
+            .onTapGesture(perform: open)
+        }
+        .frame(height: miniHeight)
+        .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.6)).frame(height: 1) }
+    }
+
+    var info: (URL?, String, String) {
+        let id = store.playingID
+        if let c = store.live.first(where: { $0.id == id }) {
+            let b = c.now
+            return (b.embeds?.details?.media?.thumb, b.title, b.endTimestamp.map { "\(hhmm(b.startTimestamp)) - \(hhmm($0))" } ?? "")
+        }
+        if let m = store.mixtapes.first(where: { $0.id == id }) {
+            return (m.media?.thumb, m.title, store.mixtapeNow?.title ?? m.subtitle)
+        }
+        if let e = store.episode, e.id == id {
+            let clock = { (s: Double) in Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
+            return (e.details.media?.thumb, e.details.name ?? "", "\(clock(store.position)) / \(clock(store.duration))")
+        }
+        return (nil, "", "")
+    }
+}
+
 /// Artwork with the show info below it, as on the NTS iPhone show page (sizes measured from it, ×0.896).
 struct NowHeader<Badge: View, Accessory: View>: View {
     let image: URL?, title: String
@@ -1361,21 +1414,11 @@ struct SectionLabel: View {
     }
 }
 
-/// Genre tags, description and the current/next track (live and archive episode pages).
+/// Description and the current/next track (live and archive episode pages).
 struct EpisodeInfo: View {
     let details: Details?, tracks: [Track]?, current: Int?, openTracklist: () -> Void
     var body: some View {
-        // Tag + description sizes measured from the NTS iPhone episode page (×0.896 for 360pt)
-        if let genres = details?.genres, !genres.isEmpty {
-            HStack(spacing: 7) {
-                ForEach(genres.prefix(4), id: \.value) {
-                    Text($0.value.nts).font(.nts(10)).opacity(0.85)
-                        .padding(.horizontal, 9).frame(height: 29)
-                        .overlay(Rectangle().strokeBorder(.white.opacity(0.33), lineWidth: 1))
-                }
-            }
-            .padding(.horizontal, pageInset).padding(.top, 12)
-        }
+        // Description size measured from the NTS iPhone episode page (×0.896 for 360pt)
         if let desc = details?.description, !desc.isEmpty {
             Text(desc).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, pageInset).padding(.top, 13)
