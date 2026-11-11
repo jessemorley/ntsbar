@@ -1183,7 +1183,8 @@ struct ShowView: View {
     @State private var done = false
     @State private var loading = false
     @State private var info: Details?   // the show itself: banner, location, frequency, description
-    @State private var titleGone = false   // banner scrolled out: the title moves to a bar with back
+    @State private var barShown = false    // artwork scrolled under the bar: back bar appears
+    @State private var titleGone = false   // then the banner's title scrolls out: the bar's title fades in
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1206,7 +1207,6 @@ struct ShowView: View {
                         }
                         .buttonStyle(.plain)
                     }
-                    .onScrollVisibilityChange(threshold: 0.001) { titleGone = !$0 }
                     if let desc = info?.description, !desc.isEmpty {
                         Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 10)
                     }
@@ -1222,12 +1222,13 @@ struct ShowView: View {
                 }
             }
             .overlay(alignment: .top) {
-                if titleGone {
+                if barShown {
                     VStack(spacing: 0) {
                         Button(action: back) {
                             HStack(spacing: 0) {
                                 Image(systemName: "chevron.left").font(.nts(15)).frame(width: 36, height: 40)
                                 Text((info?.name ?? show.title).nts).font(.nts(14)).lineLimit(1)
+                                    .opacity(titleGone ? 1 : 0).animation(.easeOut(duration: 0.15), value: titleGone)
                                 Spacer(minLength: 0)
                             }
                             .padding(.trailing, pageInset).contentShape(.rect)
@@ -1238,6 +1239,8 @@ struct ShowView: View {
                     .background(.black)
                 }
             }
+            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 221 - 2 } action: { barShown = $1 }   // bar as its bottom (41pt) meets the title's top (~260: artwork 221 + location line + gaps)
+            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 221 + 18 } action: { titleGone = $1 }   // its name fades in as the bar has almost covered the title's first line
             .task { info = try? await fetchOne(String(show.id.dropFirst())) }
             .task { await loadMore() }
         }
