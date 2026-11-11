@@ -705,7 +705,7 @@ struct Cover: View {
 // Layout measured from the NTS iPhone app (402pt wide), scaled to our 360pt popover.
 let cardHeight: CGFloat = 326
 let contentHeight = cardHeight * 2
-let pageInset: CGFloat = 14   // page margin below artwork (16pt on iPhone)
+let pageInset: CGFloat = 10   // page margin below artwork
 
 func hhmm(_ d: Date) -> String {
     d.formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
@@ -1074,7 +1074,7 @@ struct SavedView: View {
 }
 
 /// An episode as in the iPhone My NTS Episodes list (×0.896): wide artwork with a play box in its corner,
-/// title and date beside it, genres below, ⋯ menu bottom-right.
+/// title, date and boxed genre tags beside it, ⋯ menu bottom-right.
 struct EpisodeRow: View {
     @Environment(Store.self) var store
     let id: String, d: Details
@@ -1082,6 +1082,7 @@ struct EpisodeRow: View {
         let date = d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? ""
         let web = URL(string: "https://www.nts.live" + id)!
         let item = Saved(id: id, title: d.name ?? "", subtitle: date, image: d.media?.thumb)
+        let tags = (d.genres ?? []).map(\.value)
         HStack(alignment: .top, spacing: 10) {
             Cover(url: d.media?.wide).frame(width: 148, height: 93)
                 .overlay(alignment: .bottomLeading) {
@@ -1094,26 +1095,63 @@ struct EpisodeRow: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text((d.name ?? "").nts).font(.nts(14)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
                 Text(date.nts).font(.nts(11, .regular))
-                if let g = d.genres, !g.isEmpty {
-                    Text(g.map(\.value).joined(separator: " • ").nts).font(.nts(10)).opacity(0.5).lineLimit(2).padding(.top, 2)
-                }
-                Spacer(minLength: 0)
-                HStack {
-                    Spacer()
-                    Menu {
-                        Button(store.isSaved(id) ? "Remove Episode" : "Save Episode") { store.toggleSave(item) }
-                        Button("Open on nts.live") { NSWorkspace.shared.open(web) }
-                    } label: {
-                        Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 20, height: 16)
+                // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
+                ViewThatFits(in: .vertical) {
+                    ForEach((0...tags.count).reversed(), id: \.self) { n in
+                        Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: tag) }.padding(.top, 4).padding(.trailing, 26)
                     }
-                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
                 }
+                .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
             }
-            .frame(minHeight: 93)   // ⋯ sits level with the artwork's bottom edge
         }
-        .padding(.horizontal, 9).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, maxHeight: 93, alignment: .topLeading)
+        .overlay(alignment: .bottomTrailing) {
+            Menu {
+                Button(store.isSaved(id) ? "Remove Episode" : "Save Episode") { store.toggleSave(item) }
+                Button("Open on nts.live") { NSWorkspace.shared.open(web) }
+            } label: {
+                Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 20, height: 16)
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+        }
+        .padding(.horizontal, pageInset).padding(.vertical, 10)
         .contentShape(.rect)
         .onTapGesture { Task { await store.playEpisode(id) } }
+    }
+
+    func tag(_ t: String) -> some View {
+        Text(t.nts).font(.nts(9.5)).lineLimit(1).fixedSize()
+            .padding(.horizontal, 5).padding(.vertical, 3)
+            .overlay { Rectangle().stroke(.white.opacity(0.35), lineWidth: 1) }
+    }
+}
+
+/// Lays subviews out left to right, wrapping onto new lines.
+struct Flow: Layout {
+    var spacing: CGFloat = 5
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let r = rows(proposal.width ?? .infinity, subviews)
+        return CGSize(width: r.map(\.width).max() ?? 0, height: r.last.map { $0.y + $0.height } ?? 0)
+    }
+    func placeSubviews(in b: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        for row in rows(b.width, subviews) {
+            var x = b.minX
+            for i in row.items { let s = subviews[i].sizeThatFits(.unspecified)
+                subviews[i].place(at: CGPoint(x: x, y: b.minY + row.y), proposal: .unspecified); x += s.width + spacing }
+        }
+    }
+    private func rows(_ maxW: CGFloat, _ subviews: Subviews) -> [(items: [Int], y: CGFloat, width: CGFloat, height: CGFloat)] {
+        var rows: [(items: [Int], y: CGFloat, width: CGFloat, height: CGFloat)] = []
+        for (i, v) in subviews.enumerated() {
+            let s = v.sizeThatFits(.unspecified)
+            if let last = rows.last, last.width + spacing + s.width <= maxW {
+                rows[rows.count - 1].items.append(i); rows[rows.count - 1].width += spacing + s.width
+                rows[rows.count - 1].height = max(last.height, s.height)
+            } else {
+                rows.append(([i], rows.last.map { $0.y + $0.height + spacing } ?? 0, s.width, s.height))
+            }
+        }
+        return rows
     }
 }
 
@@ -1156,7 +1194,7 @@ struct ShowView: View {
                         let id = "/" + (d.episodePath ?? "")
                         EpisodeRow(id: id, d: d)
                             .onAppear { if d.episodeAlias == episodes.last?.episodeAlias { Task { await loadMore() } } }
-                        Rule()
+                        Rule().padding(.horizontal, pageInset)
                     }
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
