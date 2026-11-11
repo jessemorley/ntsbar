@@ -208,7 +208,8 @@ enum Keychain {
     var resolving = false   // fetching an archive episode's stream, before the player has an item
     var buffering = false   // player is waiting for audio
     var loading: Bool { resolving || buffering }
-    var position: Double { player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0 }
+    var position: Double { seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0) }
+    var seekTarget: Double?   // held while a seek is in flight, so the tracklist highlight jumps straight there
     var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
 
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
@@ -310,9 +311,12 @@ enum Keychain {
         problem = error.localizedDescription
     }
 
-    func skip(_ seconds: Double) {
-        let t = CMTime(seconds: min(max(0, position + seconds), duration), preferredTimescale: 600)
-        Task { await player.seek(to: t); nowPlaying() }
+    func skip(_ seconds: Double) { seek(to: position + seconds) }
+    func seek(to seconds: Double) {
+        let s = min(max(0, seconds), duration)
+        seekTarget = s
+        // exact: the default tolerance lands on the segment before, i.e. the end of the previous track
+        Task { await player.seek(to: CMTime(seconds: s, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero); seekTarget = nil; nowPlaying() }
     }
 
     var scrub: Double?   // 0…1 while dragging the tab divider over an archive episode
@@ -1396,7 +1400,7 @@ struct EpisodeNowView: View {
             let pos = store.position, dur = store.duration
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
             if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: path) { showTracklist = false }
+                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1520,7 +1524,9 @@ struct FitScroll<Content: View>: View {
 }
 
 struct TracklistView: View {
-    let tracks: [Track], current: Int?, episode: String?, back: () -> Void
+    let tracks: [Track], current: Int?, episode: String?
+    var seek: ((Double) -> Void)?   // archive episodes: tap a track to jump to it
+    let back: () -> Void
     var body: some View {
         VStack(spacing: 0) {
             Button(action: back) {
@@ -1539,6 +1545,8 @@ struct TracklistView: View {
                         // tracks repeat with the same uid (e.g. a jingle played twice), so key rows by position
                         ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
                             TrackRow(track: t, state: current == i ? .now : (current ?? -1) > i ? .past : .next, episode: episode)
+                                .contentShape(.rect)
+                                .onTapGesture { if let seek, let o = t.offset { seek(Double(o)) } }
                         }
                     }
                     .padding(.vertical, 6)
@@ -1546,6 +1554,7 @@ struct TracklistView: View {
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
         }
+        .frame(height: contentHeight, alignment: .top)   // full page height, not the shrunk Now Playing window
     }
 }
 
