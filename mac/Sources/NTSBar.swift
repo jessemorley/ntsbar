@@ -208,6 +208,8 @@ enum Keychain {
     var resolving = false   // fetching an archive episode's stream, before the player has an item
     var buffering = false   // player is waiting for audio
     var loading: Bool { resolving || buffering }
+    var pendingID: String?   // episode tapped but not yet audible, for its spinner
+    func waiting(_ id: String) -> Bool { pendingID == id || (playingID == id && buffering) }
     var position: Double { seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0) }
     var seekTarget: Double?   // held while a seek is in flight, so the tracklist highlight jumps straight there
     var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
@@ -262,8 +264,8 @@ enum Keychain {
     /// nonisolated so the off-main KVO closure doesn't inherit @MainActor and trap.
     nonisolated private func observeStatus() -> NSKeyValueObservation {
         player.observe(\.timeControlStatus) { [weak self] p, _ in
-            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate
-            Task { @MainActor in self?.buffering = waiting }
+            let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate, playing = p.timeControlStatus == .playing && p.currentItem?.status == .readyToPlay   // switching items briefly reports .playing for the old one
+            Task { @MainActor in self?.buffering = waiting; if playing { self?.pendingID = nil } }
         }
     }
 
@@ -273,7 +275,7 @@ enum Keychain {
     }
 
     func stop() {
-        listenStop(); player.pause(); playingID = nil
+        listenStop(); player.pause(); playingID = nil; pendingID = nil
         nowPlaying()
     }
 
@@ -289,7 +291,8 @@ enum Keychain {
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
     func playEpisode(_ id: String) async {
         if playingID == id { pauseResume(); return }
-        resolving = true; defer { resolving = false }
+        resolving = true; pendingID = id
+        defer { resolving = false }   // pendingID clears once audio actually plays (observeStatus), so the spinner doesn't blink at the hand-off
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.audioSources?.first?.url ?? d.mixcloud else { throw APIError(errorDescription: "No audio for this episode") }
@@ -301,7 +304,7 @@ enum Keychain {
                 Task { for await _ in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values { nowPlaying() } }
             }
             problem = nil
-        } catch { report(error) }
+        } catch { if pendingID == id { pendingID = nil }; report(error) }
     }
 
     /// Shows an error under the tab bar, except cancellations: SwiftUI cancels a view's .task
@@ -917,19 +920,20 @@ struct SaveMenu: View {
 
 struct Row: View {
     /// Episodes are playable: a play overlay on hover; the current one keeps pause (or play while paused).
-    enum Playback { case none, playable, playing, paused }
+    enum Playback { case none, playable, waiting, playing, paused }
     let image: URL?, title: String, subtitle: String
     var playback = Playback.none
     @State private var hovering = false
     var body: some View {
-        let icon = playback == .playing || playback == .paused || (playback == .playable && hovering)
+        let icon = playback == .playing || playback == .paused || playback == .waiting || (playback == .playable && hovering)
         HStack(spacing: 12) {
             Cover(url: image).frame(width: 52, height: 52)
                 .overlay {
                     if icon {
                         Color.black.opacity(0.3)
                         Group {
-                            if playback == .playing { PauseIcon() } else { Triangle() }
+                            if playback == .waiting { Spinner() }
+                        else if playback == .playing { PauseIcon() } else { Triangle() }
                         }
                         .frame(width: 14, height: 16)
                     }
@@ -949,6 +953,16 @@ struct Row: View {
         .padding(.horizontal, 9).padding(.vertical, 8)
         .contentShape(.rect)
         .onHover { hovering = $0 }
+    }
+}
+
+/// Buffering: the play triangle, breathing. Sized by the frame it's given.
+struct Spinner: View {
+    @State private var dim = false
+    var body: some View {
+        Triangle().opacity(dim ? 0.3 : 1)
+            .animation(.easeInOut(duration: 0.6).repeatForever(), value: dim)
+            .onAppear { dim = true }
     }
 }
 
@@ -1046,7 +1060,7 @@ struct SavedView: View {
                     ForEach(items) { s in
                         let web = URL(string: "https://www.nts.live" + s.id)!
                         Row(image: s.image, title: s.title, subtitle: s.subtitle,
-                            playback: !s.isEpisode ? .none : store.playingID != s.id ? .playable : store.paused ? .paused : .playing)
+                            playback: !s.isEpisode ? .none : store.waiting(s.id) ? .waiting : store.playingID != s.id ? .playable : store.paused ? .paused : .playing)
                             // episodes play in-app; hosts open their episode list
                             .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { show = s } }
                             .contextMenu {
@@ -1091,7 +1105,8 @@ struct EpisodeRow: View {
             Cover(url: d.media?.wide).frame(width: 148, height: 93)
                 .overlay(alignment: .bottomLeading) {
                     Group {
-                        if store.playingID == id && !store.paused { PauseIcon().frame(width: 13, height: 15) }
+                        if store.waiting(id) { Spinner().frame(width: 15, height: 17) }
+                        else if store.playingID == id && !store.paused { PauseIcon().frame(width: 13, height: 15) }
                         else { Triangle().frame(width: 15, height: 17) }
                     }
                     .frame(width: 49, height: 45).background(.black.opacity(0.75))
@@ -1634,3 +1649,4 @@ struct MixtapeNowView: View {
         }
     }
 }
+
