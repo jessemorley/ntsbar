@@ -737,6 +737,13 @@ func hours(_ start: Date, _ end: Date) -> String { "\(hhmm(start)) - \(hhmm(end)
 /// Playback position, e.g. 0:19:23
 func clock(_ s: Double) -> String { Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
 
+extension View {
+    /// Keeps `height` at this view's laid-out height (ignoring the zero of a first, unsized pass).
+    func measureHeight(_ height: Binding<CGFloat>) -> some View {
+        onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { height.wrappedValue = $0 } }
+    }
+}
+
 extension ScrollGeometry {
     /// How far the content has scrolled from its top.
     var scrolled: CGFloat { contentOffset.y + contentInsets.top }
@@ -775,19 +782,24 @@ struct ScrolledDown: PreferenceKey {
     static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
-/// On a page's ScrollView: down once scrolling down past 50pt, back on any scroll up (as Safari's toolbar) or near the top.
+/// On a page's ScrollView: starts its content below the app's tab bar (plus `extra`, for a header of its own
+/// floating over it), and reports scrolled down once past 50pt, back on any scroll up (as Safari's toolbar) or near the top.
 struct HidesTabs: ViewModifier {
+    var extra: CGFloat = 0
+    @Environment(\.tabBar) var tabBar
     @State private var down = false   // per scroll view: one that appears (e.g. back from a show) starts with the bar shown
     @State private var turn: CGFloat = 0   // where the scroll last turned around: hidden, the furthest down; shown, the furthest up
     static let travel: CGFloat = 40   // scroll this far one way before the bar moves, so small wheel nudges leave it be
+    struct Offset: Equatable { var y, end: CGFloat }
     func body(content: Content) -> some View {
         content
-            .onScrollGeometryChange(for: CGSize.self) { g in
-                CGSize(width: g.scrolled, height: g.contentSize.height + g.contentInsets.top + g.contentInsets.bottom - g.containerSize.height)
+            .contentMargins(.top, tabBar.height + extra, for: .scrollContent)
+            .onScrollGeometryChange(for: Offset.self) { g in
+                Offset(y: g.scrolled, end: g.contentSize.height + g.contentInsets.top + g.contentInsets.bottom - g.containerSize.height)
             } action: { _, g in
-                let y = g.width
+                let y = g.y
                 if y < 20 { down = false; turn = y; return }
-                if y > g.height { turn = y; return }   // past the end: a bounce easing back, not the reader scrolling up
+                if y > g.end { turn = y; return }   // past the end: a bounce easing back, not the reader scrolling up
                 turn = down ? max(turn, y) : min(turn, y)
                 if down ? y < turn - Self.travel : y > turn + Self.travel && y > 50 { down.toggle(); turn = y }
             }
@@ -899,7 +911,7 @@ struct RootView: View {
             }
         }
         .fixedSize(horizontal: false, vertical: true)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { tabsHeight = $0 } }
+        .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
         .background(.black)   // after the fade: a fading background would flash the list beneath
         .offset(y: tabsHidden ? -tabsHeight : 0)   // slides up out of view
@@ -1041,14 +1053,12 @@ struct PauseIcon: View {
 
 struct MixtapesView: View {
     @Environment(Store.self) var store
-    @Environment(\.tabBar) var tabBar
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(spacing: 1), GridItem()], spacing: 1) {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
-        .contentMargins(.top, tabBar.height, for: .scrollContent)
         .modifier(HidesTabs())
     }
 }
@@ -1127,7 +1137,7 @@ struct SavedView: View {
             }
             .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
             .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { titleHeight = $0 } }
+            .measureHeight($titleHeight)
             // title and icon flick out fast; the header slides up a beat slower (the app's 0.12s), carrying the tabs
             .opacity(collapsed ? 0 : 1).animation(.easeOut(duration: 0.08), value: collapsed)
             HStack(spacing: 0) {
@@ -1145,7 +1155,7 @@ struct SavedView: View {
             .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
         }
         .fixedSize(horizontal: false, vertical: true)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { headerHeight = $0 } }
+        .measureHeight($headerHeight)
         .background(.black)
         .offset(y: tabBar.visible - (collapsed ? titleHeight : 0))
     }
@@ -1175,8 +1185,7 @@ struct SavedView: View {
                 if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
             }
         }
-        .contentMargins(.top, tabBar.height + headerHeight, for: .scrollContent)
-        .modifier(HidesTabs())
+        .modifier(HidesTabs(extra: headerHeight))
         .overlay(alignment: .top) { header }
         .preference(key: CoversTabs.self, value: titleHeight)
         .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
@@ -1378,7 +1387,6 @@ struct ShowView: View {
                     .padding(.top, tabBar.visible)   // under the app's tabs while they show
                 }
             }
-            .contentMargins(.top, tabBar.height, for: .scrollContent)
             // the bar (41pt) appears as its bottom meets the title's top (~bannerHeight + 39: location line + gaps),
             // its name fades in once the title's first line is almost covered
             .onScrollGeometryChange(for: Int.self) { g in
@@ -1731,7 +1739,7 @@ struct FitScroll<Content: View>: View {
     @State private var height: CGFloat = contentHeight
     var body: some View {
         ScrollView {
-            content.onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height = $0 }
+            content.measureHeight($height)
         }
         .scrollBounceBehavior(.basedOnSize)
         .frame(height: min(height, contentHeight))
