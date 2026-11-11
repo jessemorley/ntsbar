@@ -1073,6 +1073,50 @@ struct SavedView: View {
     }
 }
 
+/// An episode as in the iPhone My NTS Episodes list (×0.896): wide artwork with a play box in its corner,
+/// title and date beside it, genres below, ⋯ menu bottom-right.
+struct EpisodeRow: View {
+    @Environment(Store.self) var store
+    let id: String, d: Details
+    var body: some View {
+        let date = d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? ""
+        let web = URL(string: "https://www.nts.live" + id)!
+        let item = Saved(id: id, title: d.name ?? "", subtitle: date, image: d.media?.thumb)
+        HStack(alignment: .top, spacing: 10) {
+            Cover(url: d.media?.wide).frame(width: 148, height: 93)
+                .overlay(alignment: .bottomLeading) {
+                    Group {
+                        if store.playingID == id && !store.paused { PauseIcon().frame(width: 13, height: 15) }
+                        else { Triangle().frame(width: 15, height: 17) }
+                    }
+                    .frame(width: 49, height: 45).background(.black.opacity(0.75))
+                }
+            VStack(alignment: .leading, spacing: 4) {
+                Text((d.name ?? "").nts).font(.nts(14)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                Text(date.nts).font(.nts(11, .regular))
+                if let g = d.genres, !g.isEmpty {
+                    Text(g.map(\.value).joined(separator: " • ").nts).font(.nts(10)).opacity(0.5).lineLimit(2).padding(.top, 2)
+                }
+                Spacer(minLength: 0)
+                HStack {
+                    Spacer()
+                    Menu {
+                        Button(store.isSaved(id) ? "Remove Episode" : "Save Episode") { store.toggleSave(item) }
+                        Button("Open on nts.live") { NSWorkspace.shared.open(web) }
+                    } label: {
+                        Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 20, height: 16)
+                    }
+                    .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+                }
+            }
+            .frame(minHeight: 93)   // ⋯ sits level with the artwork's bottom edge
+        }
+        .padding(.horizontal, 9).padding(.vertical, 10)
+        .contentShape(.rect)
+        .onTapGesture { Task { await store.playEpisode(id) } }
+    }
+}
+
 /// A followed show's archive, newest first, paged in; episodes play in-app like My NTS rows.
 struct ShowView: View {
     @Environment(Store.self) var store
@@ -1110,11 +1154,7 @@ struct ShowView: View {
                     SectionLabel(text: "Episodes", dim: false).padding(.top, -6)
                     ForEach(episodes, id: \.episodeAlias) { d in
                         let id = "/" + (d.episodePath ?? "")
-                        Row(image: d.media?.thumb, title: d.name ?? "",
-                            subtitle: d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? "",
-                            playback: store.playingID != id ? .playable : store.paused ? .paused : .playing)
-                            .onTapGesture { Task { await store.playEpisode(id) } }
-                            .contextMenu { Button("Open on nts.live") { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + id)!) } }
+                        EpisodeRow(id: id, d: d)
                             .onAppear { if d.episodeAlias == episodes.last?.episodeAlias { Task { await loadMore() } } }
                         Rule()
                     }
