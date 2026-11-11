@@ -751,6 +751,7 @@ extension String {
 }
 
 enum Page: CaseIterable { case live, nowPlaying, mixtapes, saved
+    static let tabs: [Page] = [.live, .mixtapes, .saved]   // Now Playing opens from the mini player
     var label: String {
         switch self { case .live: "LIVE"; case .nowPlaying: "NOW PLAYING"; case .mixtapes: "MIXTAPES"; case .saved: "MY NTS" }
     }
@@ -774,24 +775,73 @@ struct Shimmer: View {
     }
 }
 
-struct RootView: View {
-    @Environment(Store.self) var store
-    @State var page = Page.live
-    @State private var barHover = false
-    var mini: Bool { page != .nowPlaying && store.playingID != nil }
+extension EnvironmentValues {
+    /// Pages report whether they're scrolled a way down; the app's tab bar tucks away while they are.
+    @Entry var scrolledDown: (Bool) -> Void = { _ in }
+}
 
-    /// The divider doubles as the progress bar: live show or archive episode; solid for mixtapes, grey when idle.
+/// On a page's ScrollView: hides the app's tab bar past 50pt, brings it back under 20pt (hysteresis,
+/// as the list grows when the bar leaves, which can nudge the offset back near the end).
+struct HidesTabs: ViewModifier {
+    @Environment(\.scrolledDown) var report
+    func body(content: Content) -> some View {
+        content.onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
+            if y > 50 { report(true) } else if y < 20 { report(false) }
+        }
+    }
+}
+
+/// What's playing as a 1pt line (the mini player's divider, the foot of the Now Playing artwork):
+/// live show or archive episode progress; solid for mixtapes. Archive episodes: a handle on hover, drag to seek.
+struct ProgressLine: View {
+    @Environment(Store.self) var store
+    @State private var hover = false
+
     func progress(at now: Date) -> Double {
         if store.seekable { return store.scrub ?? store.position / store.duration }
-        guard let id = store.playingID else { return 0 }   // nothing playing: all inactive grey
+        guard let id = store.playingID else { return 0 }
         guard let c = store.live.first(where: { $0.id == id }) else { return 1 }   // mixtapes: solid
         return fraction(c.now, at: now)
     }
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let f = progress(at: ctx.date)
+            Rectangle().fill(.white.opacity(store.loading ? 0.7 : 0.3)).frame(height: 1)   // loading: dimmer white under the shimmer
+                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
+                .overlay { if store.loading { Shimmer() } }
+                .overlay(alignment: .leading) {
+                    if store.seekable && (hover || store.scrub != nil) {
+                        Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
+                    }
+                }
+        }
+        .overlay {
+            if store.seekable {
+                Color.clear.frame(height: 14).contentShape(.rect)
+                    .onHover { hover = $0 }
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { store.scrub = min(1, max(0, $0.location.x / 360)) }
+                        .onEnded { _ in store.endScrub() })
+            }
+        }
+    }
+}
+
+struct RootView: View {
+    @Environment(Store.self) var store
+    @State var page = Page.live
+    @State private var tabsHidden = false
+    @State private var tabsHeight: CGFloat = 56
+    var mini: Bool { page != .nowPlaying && store.playingID != nil }
+    /// The page's share of the window: the mini player takes some, the hidden tab bar gives its height back,
+    /// so the window keeps its size (it doesn't grow while open).
+    var pageHeight: CGFloat { contentHeight - (mini ? miniHeight : 0) + (tabsHidden ? tabsHeight : 0) }
+
+    var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                ForEach(Page.allCases, id: \.self) { p in
+                ForEach(Page.tabs, id: \.self) { p in
                     Button { page = p } label: {
                         VStack(spacing: 4) {
                             Image(systemName: p.icon).font(.system(size: 19)).frame(height: 22)
@@ -803,28 +853,10 @@ struct RootView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.bottom, 2)
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                let f = progress(at: ctx.date)
-                Rectangle().fill(.white.opacity(store.loading ? 0.7 : 0.3)).frame(height: 1)   // loading: dimmer white under the shimmer
-                    .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
-                    .overlay { if store.loading { Shimmer() } }
-                    .overlay(alignment: .leading) {   // archive episodes: a handle on hover, drag to seek
-                        if store.seekable && (barHover || store.scrub != nil) {
-                            Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
-                        }
-                    }
-            }
-            .overlay {
-                if store.seekable {
-                    Color.clear.frame(height: 14).contentShape(.rect)
-                        .onHover { barHover = $0 }
-                        .gesture(DragGesture(minimumDistance: 0)
-                            .onChanged { store.scrub = min(1, max(0, $0.location.x / 360)) }
-                            .onEnded { _ in store.endScrub() })
-                }
-            }
-            .zIndex(1)   // handle and hit area overlap the page below
+            .padding(.bottom, 2)            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { tabsHeight = $0 } }
+            .offset(y: tabsHidden ? -tabsHeight : 0).opacity(tabsHidden ? 0 : 1)   // slides up out of view
+            .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top).clipped()
             if let err = store.problem {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
                 Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
@@ -838,11 +870,14 @@ struct RootView: View {
                 case .saved: SavedView()
                 }
             }
-            // Now Playing shrinks the window to its content; other pages keep the fixed height, the mini player taking its share
-            .frame(minHeight: page == .nowPlaying ? nil : contentHeight - (mini ? miniHeight : 0),
-                   maxHeight: contentHeight - (mini ? miniHeight : 0), alignment: .top)
+            // Now Playing shrinks the window to its content; other pages keep the fixed height
+            .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
+            .environment(\.scrolledDown) { down in
+                if down != tabsHidden { withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
+            }
             if mini { MiniPlayer { page = .nowPlaying } }
         }
+        .onChange(of: page) { tabsHidden = false }   // e.g. the mini player opening Now Playing mid-scroll
     }
 }
 
@@ -971,6 +1006,7 @@ struct MixtapesView: View {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
+        .modifier(HidesTabs())
     }
 }
 
@@ -1062,7 +1098,7 @@ struct SavedView: View {
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.horizontal, pageInset + 4)
+            .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
@@ -1091,6 +1127,7 @@ struct SavedView: View {
                 // hysteresis: the list grows as the title leaves, which can nudge the offset back near the end
                 if y > 50 && !collapsed || y < 20 && collapsed { withAnimation(.easeOut(duration: 0.12)) { collapsed.toggle() } }   // the gap and tabs (a local .animation wouldn't move the tabs)
             }
+            .modifier(HidesTabs())
             .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
         }
         .clipped()   // the title slides out under the app's tab bar, not over it
@@ -1296,6 +1333,7 @@ struct ShowView: View {
                 let y = g.scrolled
                 return y > bannerHeight + 18 ? 2 : y > bannerHeight - 2 ? 1 : 0
             } action: { bar = $1 }
+            .modifier(HidesTabs())
             .task { info = try? await fetchOne(String(show.id.dropFirst())) }
             .task { await loadMore() }
         }
@@ -1395,7 +1433,7 @@ struct MiniPlayer: View {
             .onTapGesture(perform: open)
         }
         .frame(height: miniHeight)
-        .overlay(alignment: .top) { Rectangle().fill(.white.opacity(0.6)).frame(height: 1) }
+        .overlay(alignment: .top) { ProgressLine() }
     }
 
     var info: (URL?, String, String) {
@@ -1505,6 +1543,7 @@ struct PlayOverlay: View {
             .buttonStyle(.plain)
         }
         .frame(height: 221)
+        .overlay(alignment: .bottom) { ProgressLine() }
     }
 
     func control(_ symbol: String, action: @escaping () -> Void) -> some View {
