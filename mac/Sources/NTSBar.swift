@@ -218,6 +218,7 @@ enum Keychain {
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
     var problem: String?
+    var streamError: String?   // shown in the mini player while the failed item sits paused
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
@@ -237,8 +238,14 @@ enum Keychain {
             while true { await refreshMixtapeNow(); try? await Task.sleep(for: .seconds(30)) }
         }
         statusObserver = observeStatus()
+        itemObserver = observeItem()
         Task {
             for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
+        }
+        Task {   // mid-play failures (connection dropped); the background video's looper posts these too, hence the item check
+            for await (item, why) in NotificationCenter.default.notifications(named: AVPlayerItem.failedToPlayToEndTimeNotification)
+                .map({ (($0.object as? AVPlayerItem).map(ObjectIdentifier.init),($0.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription) })
+            where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
         if !CommandLine.arguments.contains("--snapshot") { remoteCommands() }
     }
@@ -249,6 +256,7 @@ enum Keychain {
         if playingID == id { if paused { pauseResume() } else { stop() }; return }
         guard let u = URL(string: url) else { return }
         listenStop()
+        streamError = nil
         streamURL = u
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
@@ -260,6 +268,7 @@ enum Keychain {
 
     @ObservationIgnored private var streamURL: URL?
     @ObservationIgnored private var statusObserver: NSKeyValueObservation?
+    @ObservationIgnored private var itemObserver: NSKeyValueObservation?
 
     /// KVO, not publisher(for:).values: that async sequence drops changes emitted between awaits.
     /// nonisolated so the off-main KVO closure doesn't inherit @MainActor and trap.
@@ -268,6 +277,23 @@ enum Keychain {
             let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate, playing = p.timeControlStatus == .playing && p.currentItem?.status == .readyToPlay   // switching items briefly reports .playing for the old one
             Task { @MainActor in self?.buffering = waiting; if playing { self?.pendingID = nil } }
         }
+    }
+
+    /// Item can't open (bad URL, expired certificate, 404): status goes .failed.
+    nonisolated private func observeItem() -> NSKeyValueObservation {
+        player.observe(\.currentItem?.status) { [weak self] p, _ in
+            guard let item = p.currentItem, item.status == .failed else { return }
+            let why = item.error?.localizedDescription   // e.g. "The certificate for this server is invalid."
+            Task { @MainActor in self?.streamFailed(why) }
+        }
+    }
+
+    /// Leaves the item in the mini player, paused, with the reason in place of its subtitle; play retries.
+    func streamFailed(_ why: String?) {
+        guard playingID != nil else { return }
+        listenStop(); player.pause(); paused = true; pendingID = nil
+        streamError = "Can't play stream" + (why.map { ". \($0)" } ?? "")
+        nowPlaying()
     }
 
     func refreshMixtapeNow() async {
@@ -284,9 +310,10 @@ enum Keychain {
     func pauseResume() {
         defer { nowPlaying() }
         if !paused { listenStop(); player.pause() }
-        else if episode?.id == playingID { player.play(); paused = false; listenStart(); return }
+        else if episode?.id == playingID && streamError == nil { player.play(); paused = false; listenStart(); return }   // ponytail: a failed episode retries from the start, seek back if that annoys
         else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
         paused.toggle()
+        streamError = nil
     }
 
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
@@ -1483,7 +1510,11 @@ struct MiniPlayer: View {
                 .buttonStyle(.plain)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title.nts).font(.nts(14)).lineLimit(1)
-                    Text(subtitle.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                    if let err = store.streamError {
+                        Text(err).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).help(err)
+                    } else {
+                        Text(subtitle.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 8)
                 Image(systemName: "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
