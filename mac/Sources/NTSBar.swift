@@ -12,6 +12,7 @@ struct Media: Decodable {
     var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?, animationThumb: String?
     var thumb: URL? { (pictureSmall ?? pictureMedium ?? pictureLarge).flatMap(URL.init) }
     var wide: URL? { (backgroundMediumLarge ?? pictureLarge).flatMap(URL.init) }
+    var square: URL? { (pictureMedium ?? pictureLarge ?? pictureSmall).flatMap(URL.init) }
 }
 struct Tag: Decodable { var value: String }
 struct Details: Decodable {
@@ -918,44 +919,6 @@ struct SaveMenu: View {
 
 // MARK: - Mixtapes / Saved
 
-struct Row: View {
-    /// Episodes are playable: a play overlay on hover; the current one keeps pause (or play while paused).
-    enum Playback { case none, playable, waiting, playing, paused }
-    let image: URL?, title: String, subtitle: String
-    var playback = Playback.none
-    @State private var hovering = false
-    var body: some View {
-        let icon = playback == .playing || playback == .paused || playback == .waiting || (playback == .playable && hovering)
-        HStack(spacing: 12) {
-            Cover(url: image).frame(width: 52, height: 52)
-                .overlay {
-                    if icon {
-                        Color.black.opacity(0.3)
-                        Group {
-                            if playback == .waiting { Spinner() }
-                        else if playback == .playing { PauseIcon() } else { Triangle() }
-                        }
-                        .frame(width: 14, height: 16)
-                    }
-                }
-            VStack(alignment: .leading, spacing: 2) {
-                // sizes from the iPhone My NTS list (×0.896): bold title, regular uppercase date
-                Text(title.nts).font(.nts(14)).lineLimit(2)
-                if subtitle.hasPrefix("Last episode ") {   // hosts: grey, only the age bold
-                    (Text("Last episode ".nts) + Text(String(subtitle.dropFirst(13)).nts).font(.nts(11)))
-                        .font(.nts(11, .regular)).opacity(0.6).lineLimit(1)
-                } else {
-                    Text(subtitle.nts).font(.nts(11, .regular)).lineLimit(1)
-                }
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 9).padding(.vertical, 8)
-        .contentShape(.rect)
-        .onHover { hovering = $0 }
-    }
-}
-
 /// Buffering: the play triangle, breathing. Sized by the frame it's given.
 struct Spinner: View {
     @State private var dim = false
@@ -1019,7 +982,7 @@ struct MixtapeTile: View {
 
 struct SavedView: View {
     @Environment(Store.self) var store
-    @State private var tab = CommandLine.arguments.contains("history") ? SavedTab.history : .hosts   // `--snapshot … --tab saved history`
+    @State private var tab = SavedTab.allCases.first { CommandLine.arguments.contains($0.rawValue) } ?? .hosts   // `--snapshot … --tab saved history`
     // a followed show's episodes, in place of the tabs; `--snapshot … --tab saved --show /shows/x` opens one
     @State private var show: Saved? = CommandLine.arguments.firstIndex(of: "--show").flatMap { i in
         CommandLine.arguments.indices.contains(i + 1) ? Saved(id: CommandLine.arguments[i + 1], title: "", subtitle: "") : nil
@@ -1058,17 +1021,9 @@ struct SavedView: View {
                         empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
                     }
                     ForEach(items) { s in
-                        let web = URL(string: "https://www.nts.live" + s.id)!
-                        Row(image: s.image, title: s.title, subtitle: s.subtitle,
-                            playback: !s.isEpisode ? .none : store.waiting(s.id) ? .waiting : store.playingID != s.id ? .playable : store.paused ? .paused : .playing)
-                            // episodes play in-app; hosts open their episode list
-                            .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { show = s } }
-                            .contextMenu {
-                                Button("Open on nts.live") { NSWorkspace.shared.open(web) }
-                                if tab != .history { Button(tab == .hosts ? "Unfollow Show" : "Remove Episode") { store.toggleSave(s) } }
-                            }
+                        SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
                             .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
-                        Rule()
+                        Rule().padding(.horizontal, pageInset)
                     }
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
@@ -1091,29 +1046,64 @@ struct SavedView: View {
     }
 }
 
+/// A My NTS item as an EpisodeRow; the feed's article is thin, so the full details (artwork, genres) load per row.
+struct SavedRow: View {
+    let s: Saved, open: () -> Void
+    @State private var d: Details?
+    var body: some View {
+        EpisodeRow(id: s.id, d: d ?? Details(name: s.title), subtitle: s.subtitle, image: s.image, open: open)
+            .task { d = try? await fetchOne(String(s.id.dropFirst())) }
+    }
+}
+
 /// An episode as in the iPhone My NTS Episodes list (×0.896): wide artwork with a play box in its corner,
 /// title, date and boxed genre tags beside it, ⋯ menu bottom-right.
+/// A show (id without /episodes/) gets square artwork, no play box, and `open` on tap.
 struct EpisodeRow: View {
     @Environment(Store.self) var store
     let id: String, d: Details
+    var subtitle = ""      // shown when the details carry no date (shows; episodes still loading)
+    var image: URL?        // until the details' artwork arrives
+    var open: () -> Void = {}
+    @State private var latest: String?   // shows: the newest episode, once its play button is used
     var body: some View {
-        let date = d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? ""
+        let isEpisode = id.contains("/episodes/")
+        let date = d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? subtitle
         let web = URL(string: "https://www.nts.live" + id)!
-        let item = Saved(id: id, title: d.name ?? "", subtitle: date, image: d.media?.thumb)
+        let item = Saved(id: id, title: d.name ?? "", subtitle: date, image: d.media?.thumb ?? image)
         let tags = (d.genres ?? []).map(\.value)
         HStack(alignment: .top, spacing: 10) {
-            Cover(url: d.media?.wide).frame(width: 148, height: 93)
+            Cover(url: (isEpisode ? d.media?.wide : d.media?.square) ?? image).frame(width: isEpisode ? 148 : 93, height: 93)
                 .overlay(alignment: .bottomLeading) {
-                    Group {
+                    if isEpisode { Group {
                         if store.waiting(id) { Spinner().frame(width: 15, height: 17) }
                         else if store.playingID == id && !store.paused { PauseIcon().frame(width: 13, height: 15) }
                         else { Triangle().frame(width: 15, height: 17) }
                     }
-                    .frame(width: 49, height: 45).background(.black.opacity(0.75))
+                    .frame(width: 49, height: 45).background(.black.opacity(0.75)) }
                 }
             VStack(alignment: .leading, spacing: 4) {
                 Text((d.name ?? "").nts).font(.nts(14)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
-                Text(date.nts).font(.nts(11, .regular))
+                if !isEpisode {   // shows: ▶ newest episode + grey "Last episode", only the age bold, on the artwork's bottom edge
+                    HStack(spacing: 1) {
+                        Button { Task { await playLatest() } } label: {
+                            Group {
+                                if let l = latest, store.waiting(l) { Spinner().frame(width: 10, height: 12) }
+                                else if let l = latest, store.playingID == l && !store.paused { PauseIcon().frame(width: 9, height: 11) }
+                                else { Triangle().frame(width: 10, height: 12) }
+                            }
+                            .frame(width: 20, height: 20).contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        if date.hasPrefix("Last episode ") {
+                            (Text("Last episode ".nts) + Text(String(date.dropFirst(13)).nts).font(.nts(11)))
+                                .font(.nts(11, .regular)).opacity(0.6).lineLimit(1)
+                        }
+                    }
+                    .padding(.leading, -5)   // triangle on the text edge, hit area spilling left
+                    .frame(maxHeight: .infinity, alignment: .bottomLeading)
+                } else {
+                    Text(date.nts).font(.nts(11, .regular))
                 // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
                 ViewThatFits(in: .vertical) {
                     ForEach((0...tags.count).reversed(), id: \.self) { n in
@@ -1121,12 +1111,14 @@ struct EpisodeRow: View {
                     }
                 }
                 .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: 93, alignment: .topLeading)
         .overlay(alignment: .bottomTrailing) {
             Menu {
-                Button(store.isSaved(id) ? "Remove Episode" : "Save Episode") { store.toggleSave(item) }
+                if isEpisode { Button(store.isSaved(id) ? "Remove Episode" : "Save Episode") { store.toggleSave(item) } }
+                else { Button(store.isSaved(id) ? "Unfollow Show" : "Follow Show") { store.toggleSave(item) } }
                 Button("Open on nts.live") { NSWorkspace.shared.open(web) }
             } label: {
                 Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 20, height: 16)
@@ -1135,7 +1127,16 @@ struct EpisodeRow: View {
         }
         .padding(.horizontal, pageInset).padding(.vertical, 10)
         .contentShape(.rect)
-        .onTapGesture { Task { await store.playEpisode(id) } }
+        .onTapGesture { if isEpisode { Task { await store.playEpisode(id) } } else { open() } }
+    }
+
+    func playLatest() async {
+        if latest == nil {
+            let page = try? await fetchOne(String(id.dropFirst()) + "/episodes", as: Results<Details>.self,
+                                           query: [.init(name: "limit", value: "1")]).results
+            latest = page?.first?.episodePath.map { "/" + $0 }
+        }
+        if let l = latest { await store.playEpisode(l) }
     }
 
     func tag(_ t: String) -> some View {
@@ -1182,6 +1183,7 @@ struct ShowView: View {
     @State private var done = false
     @State private var loading = false
     @State private var info: Details?   // the show itself: banner, location, frequency, description
+    @State private var titleGone = false   // banner scrolled out: the title moves to a bar with back
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1204,6 +1206,7 @@ struct ShowView: View {
                         }
                         .buttonStyle(.plain)
                     }
+                    .onScrollVisibilityChange(threshold: 0.001) { titleGone = !$0 }
                     if let desc = info?.description, !desc.isEmpty {
                         Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 10)
                     }
@@ -1216,6 +1219,23 @@ struct ShowView: View {
                         Rule().padding(.horizontal, pageInset)
                     }
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                }
+            }
+            .overlay(alignment: .top) {
+                if titleGone {
+                    VStack(spacing: 0) {
+                        Button(action: back) {
+                            HStack(spacing: 0) {
+                                Image(systemName: "chevron.left").font(.nts(15)).frame(width: 36, height: 40)
+                                Text((info?.name ?? show.title).nts).font(.nts(14)).lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.trailing, pageInset).contentShape(.rect)
+                        }
+                        .buttonStyle(.plain)
+                        Rule()
+                    }
+                    .background(.black)
                 }
             }
             .task { info = try? await fetchOne(String(show.id.dropFirst())) }
