@@ -779,15 +779,19 @@ struct ScrolledDown: PreferenceKey {
 struct HidesTabs: ViewModifier {
     @State private var down = false   // per scroll view: one that appears (e.g. back from a show) starts with the bar shown
     @State private var quietUntil = Date.distantPast
+    @State private var turn: CGFloat = 0   // where the scroll last turned around: hidden, the furthest down; shown, the furthest up
+    static let travel: CGFloat = 40   // scroll this far one way before the bar moves, so small wheel nudges leave it be
     func body(content: Content) -> some View {
         content
-            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { old, y in
-                if y < 20 { down = false; return }
+            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
+                if y < 20 { down = false; turn = y; return }
                 // the bars coming or going resize the view and the offset shifts after it (a beat later, not in the
                 // same update): not the reader scrolling. ponytail: a 0.25s lockout over the 0.12s slide; tie it to the animation if it ever misfires
-                guard Date.now > quietUntil else { return }
-                let next = y > old ? y > 50 : y < old ? false : down
-                if next != down { down = next; quietUntil = .now + 0.25 }
+                guard Date.now > quietUntil else { turn = y; return }
+                turn = down ? max(turn, y) : min(turn, y)
+                if down ? y < turn - Self.travel : y > turn + Self.travel && y > 50 {
+                    down.toggle(); turn = y; quietUntil = .now + 0.25
+                }
             }
             .preference(key: ScrolledDown.self, value: down)
     }
