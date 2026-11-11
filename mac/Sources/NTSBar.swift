@@ -1435,7 +1435,8 @@ struct EpisodeInfo: View {
             .buttonStyle(.plain)
             // always one row (the first track before it starts):
             // the menu bar window doesn't grow while open, so the section mustn't change height
-            TrackRow(track: tracks[current ?? 0], state: current == nil ? .next : .now, episode: details?.episodePath)
+            TrackRow(track: tracks[current ?? 0], state: .next, episode: details?.episodePath)   // .next: no highlight, the label says it's playing
+                .padding(.top, -6)
         }
     }
 }
@@ -1502,7 +1503,7 @@ struct EpisodeNowView: View {
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
                         EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
-                        Spacer(minLength: 20)
+                        Spacer(minLength: 12)
                     }
                 }
             }
@@ -1609,6 +1610,8 @@ struct TracklistView: View {
     let tracks: [Track], current: Int?, episode: String?
     var seek: ((Double) -> Void)?   // archive episodes: tap a track to jump to it
     let back: () -> Void
+    @State private var listHeight = contentHeight
+    @State private var scrolled = false
     var body: some View {
         VStack(spacing: 0) {
             Button(action: back) {
@@ -1620,7 +1623,7 @@ struct TracklistView: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            Rule()
+            Rule().opacity(scrolled ? 1 : 0)   // only once rows pass under the header
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
@@ -1633,10 +1636,13 @@ struct TracklistView: View {
                     }
                     .padding(.vertical, 6)
                 }
+                .scrollBounceBehavior(.basedOnSize)
+                .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 0.5 } action: { scrolled = $1 }
+                .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { listHeight = $1 }
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
+            .frame(height: min(listHeight, contentHeight - 45))   // short lists: the window shrinks to fit, as FitScroll does
         }
-        .frame(height: contentHeight, alignment: .top)   // full page height, not the shrunk Now Playing window
     }
 }
 
