@@ -17,6 +17,7 @@ struct Tag: Decodable { var value: String }
 struct Details: Decodable {
     var name: String?, description: String?, locationLong: String?, showAlias: String?, episodeAlias: String?
     var media: Media?, genres: [Tag]?
+    var frequency: String?   // shows: MONTHLY, WEEKLY…
     // archive episodes (/shows/x/episodes/y); strings so /live's embeds can't fail to decode
     var broadcast: String?, mixcloud: String?, audioSources: [Source]?
     struct Source: Decodable { var url: String? }
@@ -1079,21 +1080,34 @@ struct ShowView: View {
     @State private var episodes: [Details] = []
     @State private var done = false
     @State private var loading = false
+    @State private var info: Details?   // the show itself: banner, location, frequency, description
 
     var body: some View {
         VStack(spacing: 0) {
-            Button(action: back) {
-                HStack(spacing: 0) {
-                    Image(systemName: "chevron.left").font(.nts(15)).frame(width: 44, height: 44)
-                    Text((show.title.isEmpty ? episodes.first?.name ?? "" : show.title).nts).font(.nts(18)).lineLimit(1)
-                    Spacer()
-                }
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            Rule()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    // banner as on the NTS iPhone show page: artwork, LOCATION · FREQUENCY, title + follow, description
+                    NowHeader(image: info?.media?.wide, title: info?.name ?? show.title, titleSize: 22) {
+                        HStack(spacing: 7) {
+                            if let l = info?.locationLong { Text(l.nts).font(.nts(12.4)) }
+                            if info?.locationLong != nil, info?.frequency != nil { Text("·").font(.nts(12.4)) }
+                            if let f = info?.frequency { Text(f.nts).font(.nts(12.4, .regular)) }
+                        }
+                    } accessory: {
+                        SaveMenu(details: info, title: info?.name ?? show.title, date: .now, size: 15)
+                    }
+                    .overlay(alignment: .topLeading) {
+                        Button(action: back) {
+                            Image(systemName: "chevron.left").font(.nts(17)).frame(width: 44, height: 44).contentShape(.rect)
+                                .shadow(color: .black.opacity(0.6), radius: 4)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    if let desc = info?.description, !desc.isEmpty {
+                        Text(desc).font(.system(size: 13)).padding(.horizontal, pageInset).padding(.top, 10)
+                    }
+                    Rule().padding(.horizontal, pageInset).padding(.top, 18)
+                    SectionLabel(text: "Episodes", dim: false).padding(.top, -6)
                     ForEach(episodes, id: \.episodeAlias) { d in
                         let id = "/" + (d.episodePath ?? "")
                         Row(image: d.media?.thumb, title: d.name ?? "",
@@ -1107,6 +1121,7 @@ struct ShowView: View {
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
+            .task { info = try? await fetchOne(String(show.id.dropFirst())) }
             .task { await loadMore() }
         }
     }
