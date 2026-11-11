@@ -1002,7 +1002,8 @@ struct SavedView: View {
         if let s = show { ShowView(show: s) { show = nil } } else { lists }
     }
 
-    @State private var scrolled = false
+    @State private var collapsed = false   // title row tucked away once scrolled a way down
+    @State private var titleHeight: CGFloat = 58
     var lists: some View {
         VStack(spacing: 0) {
             HStack {   // as on the iPhone app; the account menu replaces the old footer
@@ -1022,6 +1023,12 @@ struct SavedView: View {
                 .scaleEffect(1.8)   // ponytail: the menu button draws its label at control size, ignoring .font; scaled up to the iPhone's ~24pt
             }
             .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
+            .fixedSize(horizontal: false, vertical: true)
+            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { titleHeight = $0 } }
+            // title and icon flick out fast; the space they leave closes a beat slower, carrying the tabs up
+            .offset(y: collapsed ? -titleHeight : 0).opacity(collapsed ? 0 : 1)
+            .animation(.easeOut(duration: 0.08), value: collapsed)   // overrides the slower withAnimation below
+            .frame(height: collapsed ? 0 : titleHeight, alignment: .top).clipped()
             HStack(spacing: 0) {
                 ForEach(SavedTab.allCases, id: \.self) { t in
                     Button { tab = t } label: {
@@ -1032,7 +1039,6 @@ struct SavedView: View {
                     .buttonStyle(.plain)
                 }
             }
-            Rule().opacity(scrolled ? 1 : 0)   // only once rows pass under the tabs
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
@@ -1050,9 +1056,13 @@ struct SavedView: View {
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
-            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 0.5 } action: { scrolled = $1 }
+            .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y + $0.contentInsets.top } action: { _, y in
+                // hysteresis: the list grows as the title leaves, which can nudge the offset back near the end
+                if y > 50 && !collapsed || y < 20 && collapsed { withAnimation(.easeOut(duration: 0.12)) { collapsed.toggle() } }   // the gap and tabs (a local .animation wouldn't move the tabs)
+            }
             .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
         }
+        .clipped()   // the title slides out under the app's tab bar, not over it
     }
 
     func empty(_ text: String) -> some View {
