@@ -25,4 +25,6 @@ cat > "$APP/Info.plist" <<PLIST
   <key>LSMinimumSystemVersion</key><string>27.0</string>
 </dict></plist>
 PLIST
+# Stable signature so the keychain item's ACL survives rebuilds (ad-hoc cdhash changes every build)
+codesign --force --sign "Apple Development" --identifier com.jessemorley.ntsbar NTSBar.app
 echo "Built $(pwd)/NTSBar.app"
