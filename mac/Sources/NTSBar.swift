@@ -807,6 +807,12 @@ extension EnvironmentValues {
     @Entry var tabBar = TabBarInset()
 }
 
+/// My NTS's title height: its header slides up over the app's tab bar, which is cut off at the header's top edge.
+struct CoversTabs: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 /// What's playing as a 1pt line (the mini player's divider, the foot of the Now Playing artwork):
 /// live show or archive episode progress; solid for mixtapes. Archive episodes: a handle on hover, drag to seek.
 struct ProgressLine: View {
@@ -849,6 +855,7 @@ struct RootView: View {
     @State var page = Page.live
     @State private var tabsHidden = false
     @State private var tabsHeight: CGFloat = 54
+    @State private var coverTitle: CGFloat = 0   // My NTS's title height, while its header is on screen
     var mini: Bool { page != .nowPlaying && store.playingID != nil }
     /// The page runs under the tab bar; the mini player takes its share.
     var pageHeight: CGFloat { tabsHeight + contentHeight - (mini ? miniHeight : 0) }
@@ -870,6 +877,7 @@ struct RootView: View {
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
             // pages without HidesTabs (Live, Now Playing) report false, so switching pages brings the bar back
             .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
+            .onPreferenceChange(CoversTabs.self) { coverTitle = $0 }
             .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
             .clipped()   // the bar slides up out of the window
             if mini { MiniPlayer { page = .nowPlaying } }
@@ -896,6 +904,12 @@ struct RootView: View {
         .background(.black)   // after the fade: a fading background would flash the list beneath
         .offset(y: tabsHidden ? -tabsHeight : 0)   // slides up out of view
         .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top)
+        .mask(alignment: .top) {
+            // only what's above My NTS's header, which travels from below the bar to a title's height above the top,
+            // on the same animation: the header seems to slide over the bar
+            let edge = coverTitle > 0 && tabsHidden ? -coverTitle : tabsHeight
+            Rectangle().frame(height: 200).offset(y: edge - 200)
+        }
     }
 
     @ViewBuilder var problem: some View {
@@ -1164,6 +1178,7 @@ struct SavedView: View {
         .contentMargins(.top, tabBar.height + headerHeight, for: .scrollContent)
         .modifier(HidesTabs())
         .overlay(alignment: .top) { header }
+        .preference(key: CoversTabs.self, value: titleHeight)
         .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
     }
 
