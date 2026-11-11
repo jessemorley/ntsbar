@@ -1512,10 +1512,29 @@ struct MiniPlayer: View {
     @Environment(Store.self) var store
     var expanded = false   // on Now Playing: the chevron points down, a tap goes back
     let open: () -> Void
+    @State private var hover = false
+
+    /// The playing episode's tracklist path and how far in we are (live shows and archive episodes; mixtapes have none).
+    func episode(at now: Date) -> (path: String, elapsed: Double)? {
+        let id = store.playingID
+        if let c = store.live.first(where: { $0.id == id }), let p = c.now.embeds?.details?.episodePath {
+            return (p, now.timeIntervalSince(c.now.startTimestamp))
+        }
+        if let e = store.episode, e.id == id { return (String(e.id.dropFirst()), store.position) }
+        return nil
+    }
+
+    /// Hovered: the track playing now, from the tracklist, in place of the subtitle.
+    func track(at now: Date) -> String? {
+        guard hover, let (path, elapsed) = episode(at: now),
+              let t = store.tracklists[path]?.last(where: { Double($0.offset ?? .max) <= elapsed }) else { return nil }
+        return [t.artist, t.title].compactMap { $0 }.joined(separator: " - ")
+    }
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
-            let (image, title, subtitle) = info
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let (image, title, info) = info
+            let subtitle = track(at: ctx.date) ?? info
             HStack(spacing: 0) {
                 Cover(url: image).frame(width: miniHeight, height: miniHeight)
                 Button { store.pauseResume() } label: {
@@ -1538,6 +1557,8 @@ struct MiniPlayer: View {
             }
             .contentShape(.rect)
             .onTapGesture(perform: open)
+            .onHover { hover = $0 }
+            .task(id: episode(at: ctx.date)?.path) { if let p = episode(at: .now)?.path { await store.loadTracklist(p) } }
         }
         .frame(height: miniHeight)
         .overlay(alignment: .top) { ProgressLine() }
