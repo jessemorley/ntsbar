@@ -775,14 +775,19 @@ struct ScrolledDown: PreferenceKey {
     static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
-/// On a page's ScrollView: scrolled down past 50pt, back under 20pt (hysteresis, as the list grows when
-/// the bars leave, which can nudge the offset back near the end).
+/// On a page's ScrollView: down once scrolling down past 50pt, back on any scroll up (as Safari's toolbar) or near the top.
 struct HidesTabs: ViewModifier {
     @State private var down = false   // per scroll view: one that appears (e.g. back from a show) starts with the bar shown
+    @State private var quietUntil = Date.distantPast
     func body(content: Content) -> some View {
         content
-            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
-                if y > 50 { down = true } else if y < 20 { down = false }
+            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { old, y in
+                if y < 20 { down = false; return }
+                // the bars coming or going resize the view and the offset shifts after it (a beat later, not in the
+                // same update): not the reader scrolling. ponytail: a 0.25s lockout over the 0.12s slide; tie it to the animation if it ever misfires
+                guard Date.now > quietUntil else { return }
+                let next = y > old ? y > 50 : y < old ? false : down
+                if next != down { down = next; quietUntil = .now + 0.25 }
             }
             .preference(key: ScrolledDown.self, value: down)
     }
