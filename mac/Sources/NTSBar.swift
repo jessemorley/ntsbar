@@ -1002,8 +1002,26 @@ struct SavedView: View {
         if let s = show { ShowView(show: s) { show = nil } } else { lists }
     }
 
+    @State private var scrolled = false
     var lists: some View {
         VStack(spacing: 0) {
+            HStack {   // as on the iPhone app; the account menu replaces the old footer
+                Text("MY NTS".nts).font(.nts(32))
+                Spacer()
+                Menu {
+                    if let e = store.email {
+                        Text(e)
+                        Button("Sign Out") { store.signOut() }
+                        Divider()
+                    }
+                    Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
+                } label: {
+                    Image(systemName: "person.crop.circle.fill").font(.system(size: 24))
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+                .scaleEffect(1.8)   // ponytail: the menu button draws its label at control size, ignoring .font; scaled up to the iPhone's ~24pt
+            }
+            .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
             HStack(spacing: 0) {
                 ForEach(SavedTab.allCases, id: \.self) { t in
                     Button { tab = t } label: {
@@ -1014,7 +1032,7 @@ struct SavedView: View {
                     .buttonStyle(.plain)
                 }
             }
-            Rule()
+            Rule().opacity(scrolled ? 1 : 0)   // only once rows pass under the tabs
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
@@ -1032,16 +1050,8 @@ struct SavedView: View {
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
+            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 0.5 } action: { scrolled = $1 }
             .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
-            HStack {
-                if let e = store.email {
-                    Text(e).font(.system(size: 11)).opacity(0.5).lineLimit(1)
-                    Button("SIGN OUT".nts) { store.signOut() }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
-                }
-                Spacer()
-                Button("QUIT") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }.buttonStyle(.plain).font(.nts(13)).opacity(0.5)
-            }
-            .padding(10)
         }
     }
 
