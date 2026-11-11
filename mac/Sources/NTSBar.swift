@@ -871,7 +871,7 @@ struct RootView: View {
     var mini: Bool { page != .nowPlaying && store.playingID != nil }
     /// The page runs under the tab bar; the mini player takes its share.
     var pageHeight: CGFloat { tabsHeight + contentHeight - (mini ? miniHeight : 0) }
-    var scrollsUnderTabs: Bool { page == .mixtapes || page == .saved }   // the rest start below the bar
+    var scrollsUnderTabs: Bool { page == .saved }   // only My NTS hides the bar; the rest start below it
 
     var body: some View {
         VStack(spacing: 0) {
@@ -887,7 +887,7 @@ struct RootView: View {
             .environment(\.tabBar, TabBarInset(height: tabsHeight, shown: !tabsHidden))
             // Now Playing shrinks the window to its content; other pages keep the fixed height
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
-            // pages without HidesTabs (Live, Now Playing) report false, so switching pages brings the bar back
+            // pages without HidesTabs (all but My NTS) report false, so switching pages brings the bar back
             .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
             .onPreferenceChange(CoversTabs.self) { coverTitle = $0 }
             .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
@@ -1059,7 +1059,6 @@ struct MixtapesView: View {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
-        .modifier(HidesTabs())
     }
 }
 
