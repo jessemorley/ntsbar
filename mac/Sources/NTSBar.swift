@@ -1289,7 +1289,7 @@ struct EpisodeRow: View {
                     // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
                     ViewThatFits(in: .vertical) {
                         ForEach((0...tags.count).reversed(), id: \.self) { n in
-                            Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: tag) }.padding(.top, 4).padding(.trailing, 26)
+                            Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: genreTag) }.padding(.top, 4).padding(.trailing, 26)
                         }
                     }
                     .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
@@ -1327,12 +1327,13 @@ struct EpisodeRow: View {
         }
         if let l = latest { await store.playEpisode(l) }
     }
+}
 
-    func tag(_ t: String) -> some View {
-        Text(t.nts).font(.nts(9.5)).lineLimit(1).fixedSize()
-            .padding(.horizontal, 5).padding(.vertical, 3)
-            .overlay { Rectangle().stroke(.white.opacity(0.35), lineWidth: 1) }
-    }
+/// A boxed genre tag, as on nts.live.
+func genreTag(_ t: String) -> some View {
+    Text(t.nts).font(.nts(9.5)).lineLimit(1).fixedSize()
+        .padding(.horizontal, 5).padding(.vertical, 3)
+        .overlay { Rectangle().stroke(.white.opacity(0.35), lineWidth: 1) }
 }
 
 /// Lays subviews out left to right, wrapping onto new lines.
@@ -1637,6 +1638,10 @@ struct EpisodeInfo: View {
         // Description size measured from the NTS iPhone episode page (×0.896 for 360pt)
         if let desc = details?.description, !desc.isEmpty {
             Text(desc).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, pageInset).padding(.top, 13)
+        }
+        if let tags = details?.genres?.map(\.value), !tags.isEmpty {
+            Flow(spacing: 5) { ForEach(tags, id: \.self, content: genreTag) }
                 .padding(.horizontal, pageInset).padding(.top, 13)
         }
         if let tracks, !tracks.isEmpty {
