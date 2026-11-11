@@ -1347,12 +1347,9 @@ struct EpisodeInfo: View {
                     .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            // always three rows (previous, current, next; the first three before the first track starts):
+            // always one row (the first track before it starts):
             // the menu bar window doesn't grow while open, so the section mustn't change height
-            let start = max(0, min((current ?? 0) - 1, tracks.count - 3))
-            ForEach(start..<min(start + 3, tracks.count), id: \.self) { i in
-                TrackRow(track: tracks[i], state: i == current ? .now : i < (current ?? -1) ? .past : .next, episode: details?.episodePath)
-            }
+            TrackRow(track: tracks[current ?? 0], state: current == nil ? .next : .now, episode: details?.episodePath)
         }
     }
 }
@@ -1582,7 +1579,6 @@ struct TrackRow: View {
     var episode: String?   // shows/x/episodes/y, for saving the track
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            Circle().fill(.red).frame(width: 6, height: 6).padding(.top, 6).opacity(state == .now ? 1 : 0)
             VStack(alignment: .leading, spacing: 1) {
                 Text((track.artist ?? "").nts).font(.nts(12)).lineLimit(1)
                 Text(track.title ?? "").font(.system(size: 12)).opacity(0.75).lineLimit(1)
