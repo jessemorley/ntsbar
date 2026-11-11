@@ -778,23 +778,33 @@ struct ScrolledDown: PreferenceKey {
 /// On a page's ScrollView: down once scrolling down past 50pt, back on any scroll up (as Safari's toolbar) or near the top.
 struct HidesTabs: ViewModifier {
     @State private var down = false   // per scroll view: one that appears (e.g. back from a show) starts with the bar shown
-    @State private var quietUntil = Date.distantPast
     @State private var turn: CGFloat = 0   // where the scroll last turned around: hidden, the furthest down; shown, the furthest up
     static let travel: CGFloat = 40   // scroll this far one way before the bar moves, so small wheel nudges leave it be
     func body(content: Content) -> some View {
         content
-            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
+            .onScrollGeometryChange(for: CGSize.self) { g in
+                CGSize(width: g.scrolled, height: g.contentSize.height + g.contentInsets.top + g.contentInsets.bottom - g.containerSize.height)
+            } action: { _, g in
+                let y = g.width
                 if y < 20 { down = false; turn = y; return }
-                // the bars coming or going resize the view and the offset shifts after it (a beat later, not in the
-                // same update): not the reader scrolling. ponytail: a 0.25s lockout over the 0.12s slide; tie it to the animation if it ever misfires
-                guard Date.now > quietUntil else { turn = y; return }
+                if y > g.height { turn = y; return }   // past the end: a bounce easing back, not the reader scrolling up
                 turn = down ? max(turn, y) : min(turn, y)
-                if down ? y < turn - Self.travel : y > turn + Self.travel && y > 50 {
-                    down.toggle(); turn = y; quietUntil = .now + 0.25
-                }
+                if down ? y < turn - Self.travel : y > turn + Self.travel && y > 50 { down.toggle(); turn = y }
             }
             .preference(key: ScrolledDown.self, value: down)
     }
+}
+
+/// The app's tab bar floats over the page, so pages never resize as it comes and goes (a resizing ScrollView
+/// strands its offset past the end after a bounce). Scrolling pages inset their content by `height`;
+/// anything pinned to their top (My NTS's header, a show's back bar) sits `visible` down.
+struct TabBarInset: Equatable {
+    var height: CGFloat = 0, shown = true
+    var visible: CGFloat { shown ? height : 0 }
+}
+
+extension EnvironmentValues {
+    @Entry var tabBar = TabBarInset()
 }
 
 /// What's playing as a 1pt line (the mini player's divider, the foot of the Now Playing artwork):
@@ -838,36 +848,14 @@ struct RootView: View {
     @Environment(Store.self) var store
     @State var page = Page.live
     @State private var tabsHidden = false
-    @State private var tabsHeight: CGFloat = 56
+    @State private var tabsHeight: CGFloat = 54
     var mini: Bool { page != .nowPlaying && store.playingID != nil }
-    /// The page's share of the window: the mini player takes some, the hidden tab bar gives its height back,
-    /// so the window keeps its size (it doesn't grow while open).
-    var pageHeight: CGFloat { contentHeight - (mini ? miniHeight : 0) + (tabsHidden ? tabsHeight : 0) }
+    /// The page runs under the tab bar; the mini player takes its share.
+    var pageHeight: CGFloat { tabsHeight + contentHeight - (mini ? miniHeight : 0) }
+    var scrollsUnderTabs: Bool { page == .mixtapes || page == .saved }   // the rest start below the bar
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                ForEach(Page.tabs, id: \.page) { t in
-                    Button { page = t.page } label: {
-                        VStack(spacing: 4) {
-                            Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
-                            Text(t.label.nts).font(.nts(10))
-                        }
-                        .frame(maxWidth: .infinity, minHeight: 54).contentShape(.rect)
-                        .opacity(page == t.page ? 1 : 0.45)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { tabsHeight = $0 } }
-            .offset(y: tabsHidden ? -tabsHeight : 0).opacity(tabsHidden ? 0 : 1)   // slides up out of view
-            .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top).clipped()
-            if let err = store.problem {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
-                Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
-                    .onTapGesture { store.problem = nil }
-            }
             Group {
                 switch page {
                 case .live: LiveView()
@@ -876,11 +864,46 @@ struct RootView: View {
                 case .saved: SavedView()
                 }
             }
+            .padding(.top, scrollsUnderTabs ? 0 : tabsHeight)
+            .environment(\.tabBar, TabBarInset(height: tabsHeight, shown: !tabsHidden))
             // Now Playing shrinks the window to its content; other pages keep the fixed height
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
             // pages without HidesTabs (Live, Now Playing) report false, so switching pages brings the bar back
             .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
+            .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
+            .clipped()   // the bar slides up out of the window
             if mini { MiniPlayer { page = .nowPlaying } }
+        }
+    }
+
+    var tabs: some View {
+        HStack(spacing: 0) {
+            ForEach(Page.tabs, id: \.page) { t in
+                Button { page = t.page } label: {
+                    VStack(spacing: 4) {
+                        Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
+                        Text(t.label.nts).font(.nts(10))
+                    }
+                    .frame(maxWidth: .infinity, minHeight: 54).contentShape(.rect)
+                    .opacity(page == t.page ? 1 : 0.45)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { tabsHeight = $0 } }
+        .opacity(tabsHidden ? 0 : 1)
+        .background(.black)   // after the fade: a fading background would flash the list beneath
+        .offset(y: tabsHidden ? -tabsHeight : 0)   // slides up out of view
+        .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top)
+    }
+
+    @ViewBuilder var problem: some View {
+        if let err = store.problem {   // account failures (e.g. a rejected bookmark), on every page; click to dismiss
+            Text(err).font(.system(size: 11)).foregroundStyle(.red).textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 9).padding(.vertical, 6)
+                .background(.black)
+                .onTapGesture { store.problem = nil }
         }
     }
 }
@@ -1004,12 +1027,14 @@ struct PauseIcon: View {
 
 struct MixtapesView: View {
     @Environment(Store.self) var store
+    @Environment(\.tabBar) var tabBar
     var body: some View {
         ScrollView {
             LazyVGrid(columns: [GridItem(spacing: 1), GridItem()], spacing: 1) {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
+        .contentMargins(.top, tabBar.height, for: .scrollContent)
         .modifier(HidesTabs())
     }
 }
@@ -1063,9 +1088,12 @@ struct SavedView: View {
         if let s = show { ShowView(show: s) { show = nil } } else { lists }
     }
 
-    @State private var collapsed = false   // title row tucked away once scrolled a way down
+    @Environment(\.tabBar) var tabBar
     @State private var titleHeight: CGFloat = 58
-    var lists: some View {
+    @State private var headerHeight: CGFloat = 112
+    var collapsed: Bool { !tabBar.shown }   // the title row leaves with the app's tabs
+    /// Title and tabs float over the list, as the app's tabs do, so the list never resizes.
+    var header: some View {
         VStack(spacing: 0) {
             HStack {   // as on the iPhone app; the account menu replaces the old footer
                 Text("MY NTS".nts).font(.nts(32))
@@ -1086,10 +1114,8 @@ struct SavedView: View {
             .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
             .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { titleHeight = $0 } }
-            // title and icon flick out fast; the space they leave closes a beat slower, carrying the tabs up
-            .offset(y: collapsed ? -titleHeight : 0).opacity(collapsed ? 0 : 1)
-            .animation(.easeOut(duration: 0.08), value: collapsed)   // overrides the slower withAnimation below
-            .frame(height: collapsed ? 0 : titleHeight, alignment: .top).clipped()
+            // title and icon flick out fast; the header slides up a beat slower (the app's 0.12s), carrying the tabs
+            .opacity(collapsed ? 0 : 1).animation(.easeOut(duration: 0.08), value: collapsed)
             HStack(spacing: 0) {
                 // near-justified, as on iPhone: first flush left, last flush right, even gaps between
                 ForEach(SavedTab.allCases, id: \.self) { t in
@@ -1103,36 +1129,42 @@ struct SavedView: View {
                 }
             }
             .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    if store.email == nil { AccountView() }
-                    let loading = store.feeds[tab]?.loading == true
-                    let tracks = (store.feeds[.tracks]?.tracks ?? []).filter { store.savedTracks.contains($0.uid ?? "") }   // removed ones drop out
-                    if (tab == .history || tab == .tracks) && store.email == nil {
-                        empty("SIGN IN FOR \(tab.rawValue.uppercased())")
-                    } else if (tab == .tracks ? tracks.isEmpty : items.isEmpty) && !loading {
-                        empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
-                    }
-                    if tab == .tracks {
-                        ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
-                            TrackRow(track: t, state: .next)
-                                .onAppear { if i == tracks.count - 1 { Task { await store.loadMore(.tracks) } } }
-                        }
-                    }
-                    ForEach(items) { s in
-                        SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
-                            .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
-                        Rule().padding(.horizontal, pageInset)
-                    }
-                    if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
-                }
-            }
-            .modifier(HidesTabs())
-            // the gap and tabs (a local .animation wouldn't move the tabs)
-            .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { collapsed = down } }
-            .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
         }
-        .clipped()   // the title slides out under the app's tab bar, not over it
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { headerHeight = $0 } }
+        .background(.black)
+        .offset(y: tabBar.visible - (collapsed ? titleHeight : 0))
+    }
+
+    var lists: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                if store.email == nil { AccountView() }
+                let loading = store.feeds[tab]?.loading == true
+                let tracks = (store.feeds[.tracks]?.tracks ?? []).filter { store.savedTracks.contains($0.uid ?? "") }   // removed ones drop out
+                if (tab == .history || tab == .tracks) && store.email == nil {
+                    empty("SIGN IN FOR \(tab.rawValue.uppercased())")
+                } else if (tab == .tracks ? tracks.isEmpty : items.isEmpty) && !loading {
+                    empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
+                }
+                if tab == .tracks {
+                    ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
+                        TrackRow(track: t, state: .next)
+                            .onAppear { if i == tracks.count - 1 { Task { await store.loadMore(.tracks) } } }
+                    }
+                }
+                ForEach(items) { s in
+                    SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
+                        .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
+                    Rule().padding(.horizontal, pageInset)
+                }
+                if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+            }
+        }
+        .contentMargins(.top, tabBar.height + headerHeight, for: .scrollContent)
+        .modifier(HidesTabs())
+        .overlay(alignment: .top) { header }
+        .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
     }
 
     func empty(_ text: String) -> some View {
@@ -1275,6 +1307,7 @@ struct ShowView: View {
     @State private var loading = false
     @State private var info: Details?   // the show itself: banner, location, frequency, description
     @State private var bar = 0   // back bar: 0 hidden, 1 shown, 2 with the show name
+    @Environment(\.tabBar) var tabBar
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1327,8 +1360,10 @@ struct ShowView: View {
                         Rule()
                     }
                     .background(.black)
+                    .padding(.top, tabBar.visible)   // under the app's tabs while they show
                 }
             }
+            .contentMargins(.top, tabBar.height, for: .scrollContent)
             // the bar (41pt) appears as its bottom meets the title's top (~bannerHeight + 39: location line + gaps),
             // its name fades in once the title's first line is almost covered
             .onScrollGeometryChange(for: Int.self) { g in
