@@ -750,17 +750,11 @@ extension String {
     var nts: String { uppercased().replacing(" ", with: "\u{2005}") }
 }
 
-enum Page: CaseIterable { case live, nowPlaying, mixtapes, saved
-    static let tabs: [Page] = [.live, .mixtapes, .saved]   // Now Playing opens from the mini player
-    var label: String {
-        switch self { case .live: "LIVE"; case .nowPlaying: "NOW PLAYING"; case .mixtapes: "MIXTAPES"; case .saved: "MY NTS" }
-    }
-    var icon: String {
-        switch self {
-        case .live: "antenna.radiowaves.left.and.right"; case .nowPlaying: "waveform"
-        case .mixtapes: "infinity"; case .saved: "person"
-        }
-    }
+enum Page { case live, nowPlaying, mixtapes, saved
+    /// The tab bar: page, label, icon. Now Playing isn't a tab; the mini player opens it.
+    static let tabs: [(page: Page, label: String, icon: String)] = [
+        (.live, "LIVE", "antenna.radiowaves.left.and.right"), (.mixtapes, "MIXTAPES", "infinity"), (.saved, "MY NTS", "person"),
+    ]
 }
 
 /// A bright band sweeping across the divider while audio loads.
@@ -775,19 +769,22 @@ struct Shimmer: View {
     }
 }
 
-extension EnvironmentValues {
-    /// Pages report whether they're scrolled a way down; the app's tab bar tucks away while they are.
-    @Entry var scrolledDown: (Bool) -> Void = { _ in }
+/// Whether a page is scrolled a way down; the app's tab bar (and My NTS's title) tuck away while it is.
+struct ScrolledDown: PreferenceKey {
+    static let defaultValue = false
+    static func reduce(value: inout Bool, nextValue: () -> Bool) { value = value || nextValue() }
 }
 
-/// On a page's ScrollView: hides the app's tab bar past 50pt, brings it back under 20pt (hysteresis,
-/// as the list grows when the bar leaves, which can nudge the offset back near the end).
+/// On a page's ScrollView: scrolled down past 50pt, back under 20pt (hysteresis, as the list grows when
+/// the bars leave, which can nudge the offset back near the end).
 struct HidesTabs: ViewModifier {
-    @Environment(\.scrolledDown) var report
+    @State private var down = false   // per scroll view: one that appears (e.g. back from a show) starts with the bar shown
     func body(content: Content) -> some View {
-        content.onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
-            if y > 50 { report(true) } else if y < 20 { report(false) }
-        }
+        content
+            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
+                if y > 50 { down = true } else if y < 20 { down = false }
+            }
+            .preference(key: ScrolledDown.self, value: down)
     }
 }
 
@@ -841,19 +838,19 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
-                ForEach(Page.tabs, id: \.self) { p in
-                    Button { page = p } label: {
+                ForEach(Page.tabs, id: \.page) { t in
+                    Button { page = t.page } label: {
                         VStack(spacing: 4) {
-                            Image(systemName: p.icon).font(.system(size: 19)).frame(height: 22)
-                            Text(p.label.nts).font(.nts(10))
+                            Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
+                            Text(t.label.nts).font(.nts(10))
                         }
                         .frame(maxWidth: .infinity, minHeight: 54).contentShape(.rect)
-                        .opacity(page == p ? 1 : 0.45)
+                        .opacity(page == t.page ? 1 : 0.45)
                     }
                     .buttonStyle(.plain)
                 }
             }
-            .padding(.bottom, 2)            .fixedSize(horizontal: false, vertical: true)
+            .fixedSize(horizontal: false, vertical: true)
             .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { if $0 > 0 { tabsHeight = $0 } }
             .offset(y: tabsHidden ? -tabsHeight : 0).opacity(tabsHidden ? 0 : 1)   // slides up out of view
             .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top).clipped()
@@ -872,12 +869,10 @@ struct RootView: View {
             }
             // Now Playing shrinks the window to its content; other pages keep the fixed height
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
-            .environment(\.scrolledDown) { down in
-                if down != tabsHidden { withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
-            }
+            // pages without HidesTabs (Live, Now Playing) report false, so switching pages brings the bar back
+            .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
             if mini { MiniPlayer { page = .nowPlaying } }
         }
-        .onChange(of: page) { tabsHidden = false }   // e.g. the mini player opening Now Playing mid-scroll
     }
 }
 
@@ -1123,11 +1118,9 @@ struct SavedView: View {
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
-            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
-                // hysteresis: the list grows as the title leaves, which can nudge the offset back near the end
-                if y > 50 && !collapsed || y < 20 && collapsed { withAnimation(.easeOut(duration: 0.12)) { collapsed.toggle() } }   // the gap and tabs (a local .animation wouldn't move the tabs)
-            }
             .modifier(HidesTabs())
+            // the gap and tabs (a local .animation wouldn't move the tabs)
+            .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { collapsed = down } }
             .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
         }
         .clipped()   // the title slides out under the app's tab bar, not over it
