@@ -213,7 +213,7 @@ enum Keychain {
     func waiting(_ id: String) -> Bool { pendingID == id || (playingID == id && buffering) }
     var position: Double { seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0) }
     var seekTarget: Double?   // held while a seek is in flight, so the tracklist highlight jumps straight there
-    var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
+    var duration: Double = 0   // stored, not read off the player: views must see it arrive (the mini player's seek bar)
 
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
@@ -258,6 +258,7 @@ enum Keychain {
         listenStop()
         streamError = nil
         streamURL = u
+        duration = 0
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
         playingID = id
@@ -329,7 +330,11 @@ enum Keychain {
             toggle(id, hls.absoluteString)
             listenStart()
             if let item = player.currentItem {   // HLS duration arrives once the playlist loads
-                Task { for await _ in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values { nowPlaying() } }
+                Task {
+                    for await d in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values where player.currentItem === item {
+                        duration = d.seconds.isFinite ? d.seconds : 0; nowPlaying()
+                    }
+                }
             }
             problem = nil
         } catch { if pendingID == id { pendingID = nil }; report(error) }
@@ -742,7 +747,8 @@ struct Cover: View {
     let url: URL?
     var body: some View {
         Color(white: 0.12)
-            .overlay { AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear } }
+            // .clipped() hides the fill's overflow but it still takes clicks (e.g. a card's image over the play button above it)
+            .overlay { AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear }.allowsHitTesting(false) }
             .clipped()
     }
 }
@@ -791,13 +797,15 @@ enum Page { case live, nowPlaying, mixtapes, saved
     ]
 }
 
-/// A bright band sweeping across the divider while audio loads.
+/// A soft glow easing across the progress line while audio loads.
 struct Shimmer: View {
     var body: some View {
         TimelineView(.animation) { ctx in
-            let x = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2 * 480 - 120
-            LinearGradient(colors: [.clear, .white, .clear], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 120).offset(x: x)
+            let t = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.6) / 1.6
+            let e = t * t * (3 - 2 * t)   // smoothstep: eases in and out at the ends
+            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .white.opacity(0.9), location: 0.5),
+                                   .init(color: .clear, location: 1)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 180).offset(x: e * 540 - 180)
                 .frame(maxWidth: .infinity, alignment: .leading).clipped()
         }
     }
@@ -852,11 +860,12 @@ struct CoversTabs: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
-/// What's playing as a 1pt line (the mini player's divider, the foot of the Now Playing artwork):
-/// live show or archive episode progress; solid for mixtapes. Archive episodes: a handle on hover, drag to seek.
+/// What's playing as a 2pt line along the mini player's top edge:
+/// live show or archive episode progress; solid for mixtapes. Archive episodes: thickens on hover, drag to seek.
 struct ProgressLine: View {
     @Environment(Store.self) var store
     @State private var hover = false
+    static let width: CGFloat = 358   // the 360pt window less its border pixel each side
 
     func progress(at now: Date) -> Double {
         if store.seekable { return store.scrub ?? store.position / store.duration }
@@ -868,21 +877,21 @@ struct ProgressLine: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let f = progress(at: ctx.date)
-            Rectangle().fill(.white.opacity(store.loading ? 0.7 : 0.3)).frame(height: 1)   // loading: dimmer white under the shimmer
-                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
+            let grown = store.seekable && (hover || store.scrub != nil)   // seeking: the bar thickens, no knob
+            Rectangle().fill(.white.opacity(0.2))
+                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : Self.width * f) }
                 .overlay { if store.loading { Shimmer() } }
-                .overlay(alignment: .leading) {
-                    if store.seekable && (hover || store.scrub != nil) {
-                        Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
-                    }
-                }
+                .frame(height: grown ? 5 : 2)
+                .frame(height: 2, alignment: .bottom)   // grows upward, past its 2pt slot
+                .animation(.spring(duration: 0.25), value: grown)
+                .padding(.horizontal, 1)   // clear of the window's border pixel
         }
         .overlay {
             if store.seekable {
                 Color.clear.frame(height: 14).contentShape(.rect)
                     .onHover { hover = $0 }
                     .gesture(DragGesture(minimumDistance: 0)
-                        .onChanged { store.scrub = min(1, max(0, $0.location.x / 360)) }
+                        .onChanged { store.scrub = min(1, max(0, ($0.location.x - 1) / Self.width)) }
                         .onEnded { _ in store.endScrub() })
             }
         }
@@ -895,7 +904,8 @@ struct RootView: View {
     @State private var tabsHidden = false
     @State private var tabsHeight: CGFloat = 54
     @State private var coverTitle: CGFloat = 0   // My NTS's title height, while its header is on screen
-    var mini: Bool { page != .nowPlaying && store.playingID != nil }
+    @State private var back = Page.live   // where the mini player returns to from Now Playing
+    var mini: Bool { store.playingID != nil }
     /// The page runs under the tab bar; the mini player takes its share.
     var pageHeight: CGFloat { tabsHeight + contentHeight - (mini ? miniHeight : 0) }
     var scrollsUnderTabs: Bool { page == .saved }   // only My NTS hides the bar; the rest start below it
@@ -919,7 +929,11 @@ struct RootView: View {
             .onPreferenceChange(CoversTabs.self) { coverTitle = $0 }
             .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
             .clipped()   // the bar slides up out of the window
-            if mini { MiniPlayer { page = .nowPlaying } }
+            if mini {
+                MiniPlayer(expanded: page == .nowPlaying) {
+                    if page == .nowPlaying { page = back } else { back = page; page = .nowPlaying }
+                }
+            }
         }
     }
 
@@ -1496,6 +1510,7 @@ let miniHeight: CGFloat = 53   // iPhone mini player (59pt) ×0.896
 /// What's playing, under the page, as on the iPhone app: artwork, pause/play, title and times; tap to open Now Playing.
 struct MiniPlayer: View {
     @Environment(Store.self) var store
+    var expanded = false   // on Now Playing: the chevron points down, a tap goes back
     let open: () -> Void
 
     var body: some View {
@@ -1519,7 +1534,7 @@ struct MiniPlayer: View {
                     }
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
+                Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
             }
             .contentShape(.rect)
             .onTapGesture(perform: open)
@@ -1635,7 +1650,6 @@ struct PlayOverlay: View {
             .buttonStyle(.plain)
         }
         .frame(height: 221)
-        .overlay(alignment: .bottom) { ProgressLine() }
     }
 
     func control(_ symbol: String, action: @escaping () -> Void) -> some View {
@@ -1774,7 +1788,7 @@ struct FitScroll<Content: View>: View {
             content.measureHeight($height)
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(height: min(height, contentHeight))
+        .frame(height: min(height, contentHeight - miniHeight))   // only on Now Playing, which keeps the mini player
     }
 }
 
@@ -1813,7 +1827,7 @@ struct TracklistView: View {
                 .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { listHeight = $1 }
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
-            .frame(height: min(listHeight, contentHeight - 45))   // short lists: the window shrinks to fit, as FitScroll does
+            .frame(height: min(listHeight, contentHeight - 45 - miniHeight))   // short lists: the window shrinks to fit, as FitScroll does
         }
     }
 }
