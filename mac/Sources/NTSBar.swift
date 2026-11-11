@@ -66,10 +66,10 @@ func fetch<T: Decodable>(_ path: String) async throws -> [T] {
     try await fetchOne(path, as: Results<T>.self).results
 }
 
-func fetchOne<T: Decodable>(_ path: String, as: T.Type = T.self) async throws -> T {
+func fetchOne<T: Decodable>(_ path: String, as: T.Type = T.self, query: [URLQueryItem] = []) async throws -> T {
     // API sends max-age=900 and CloudFront caches per header variant, so a show change can lag up to
     // 15 min. A timestamp query makes each request a cache miss (one small request a minute).
-    let url = api.appending(path: path).appending(queryItems: [.init(name: "t", value: String(Int(Date().timeIntervalSince1970)))])
+    let url = api.appending(path: path).appending(queryItems: query + [.init(name: "t", value: String(Int(Date().timeIntervalSince1970)))])
     let (data, _) = try await URLSession.shared.data(for: URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
     let d = JSONDecoder()
     d.keyDecodingStrategy = .convertFromSnakeCase
@@ -1001,6 +1001,10 @@ struct MixtapeTile: View {
 struct SavedView: View {
     @Environment(Store.self) var store
     @State private var tab = CommandLine.arguments.contains("history") ? SavedTab.history : .hosts   // `--snapshot … --tab saved history`
+    // a followed show's episodes, in place of the tabs; `--snapshot … --tab saved --show /shows/x` opens one
+    @State private var show: Saved? = CommandLine.arguments.firstIndex(of: "--show").flatMap { i in
+        CommandLine.arguments.indices.contains(i + 1) ? Saved(id: CommandLine.arguments[i + 1], title: "", subtitle: "") : nil
+    }
 
     /// Signed in: the account's lists, paged in. Signed out: the local saves.
     var items: [Saved] {
@@ -1009,6 +1013,10 @@ struct SavedView: View {
     }
 
     var body: some View {
+        if let s = show { ShowView(show: s) { show = nil } } else { lists }
+    }
+
+    var lists: some View {
         VStack(spacing: 0) {
             HStack(spacing: 0) {
                 ForEach(SavedTab.allCases, id: \.self) { t in
@@ -1034,8 +1042,8 @@ struct SavedView: View {
                         let web = URL(string: "https://www.nts.live" + s.id)!
                         Row(image: s.image, title: s.title, subtitle: s.subtitle,
                             playback: !s.isEpisode ? .none : store.playingID != s.id ? .playable : store.paused ? .paused : .playing)
-                            // episodes play in-app; hosts open their nts.live show page
-                            .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { NSWorkspace.shared.open(web) } }
+                            // episodes play in-app; hosts open their episode list
+                            .onTapGesture { if s.isEpisode { Task { await store.playEpisode(s.id) } } else { show = s } }
                             .contextMenu {
                                 Button("Open on nts.live") { NSWorkspace.shared.open(web) }
                                 if tab != .history { Button(tab == .hosts ? "Unfollow Show" : "Remove Episode") { store.toggleSave(s) } }
@@ -1061,6 +1069,58 @@ struct SavedView: View {
 
     func empty(_ text: String) -> some View {
         Text(text.nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
+    }
+}
+
+/// A followed show's archive, newest first, paged in; episodes play in-app like My NTS rows.
+struct ShowView: View {
+    @Environment(Store.self) var store
+    let show: Saved, back: () -> Void
+    @State private var episodes: [Details] = []
+    @State private var done = false
+    @State private var loading = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Button(action: back) {
+                HStack(spacing: 0) {
+                    Image(systemName: "chevron.left").font(.nts(15)).frame(width: 44, height: 44)
+                    Text((show.title.isEmpty ? episodes.first?.name ?? "" : show.title).nts).font(.nts(18)).lineLimit(1)
+                    Spacer()
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            Rule()
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(episodes, id: \.episodeAlias) { d in
+                        let id = "/" + (d.episodePath ?? "")
+                        Row(image: d.media?.thumb, title: d.name ?? "",
+                            subtitle: d.broadcastDate?.formatted(.dateTime.day(.twoDigits).month(.abbreviated).year()) ?? "",
+                            playback: store.playingID != id ? .playable : store.paused ? .paused : .playing)
+                            .onTapGesture { Task { await store.playEpisode(id) } }
+                            .contextMenu { Button("Open on nts.live") { NSWorkspace.shared.open(URL(string: "https://www.nts.live" + id)!) } }
+                            .onAppear { if d.episodeAlias == episodes.last?.episodeAlias { Task { await loadMore() } } }
+                        Rule()
+                    }
+                    if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                }
+            }
+            .task { await loadMore() }
+        }
+    }
+
+    func loadMore() async {
+        guard !loading, !done else { return }
+        loading = true; defer { loading = false }
+        let limit = 12
+        do {
+            let page: [Details] = try await fetchOne(String(show.id.dropFirst()) + "/episodes", as: Results<Details>.self,
+                query: [.init(name: "offset", value: String(episodes.count)), .init(name: "limit", value: String(limit))]).results
+            episodes += page.filter { $0.episodePath != nil }
+            done = page.count < limit
+        } catch { store.report(error) }
     }
 }
 
