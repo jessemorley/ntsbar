@@ -974,6 +974,8 @@ struct LiveView: View {
             }
             if store.live.isEmpty && store.error == nil { ProgressView().frame(maxHeight: .infinity) }
         }
+        // the mini player appears instantly; the cards ease into the room left for it
+        .animation(.easeOut(duration: 0.2), value: store.playingID != nil)
     }
 }
 
