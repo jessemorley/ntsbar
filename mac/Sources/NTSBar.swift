@@ -1425,18 +1425,11 @@ struct EpisodeInfo: View {
         }
         if let tracks, !tracks.isEmpty {
             Rule().padding(.horizontal, pageInset).padding(.top, 18)
-            Button(action: openTracklist) {
-                SectionLabel(text: "Playing now", dim: false).padding(.top, -6)
-                    .overlay(alignment: .trailing) {
-                        Image(systemName: "chevron.right").font(.nts(13)).opacity(0.6).padding(.trailing, pageInset).padding(.top, 10)
-                    }
-                    .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
             // always one row (the first track before it starts):
             // the menu bar window doesn't grow while open, so the section mustn't change height
-            TrackRow(track: tracks[current ?? 0], state: .next, episode: details?.episodePath)   // .next: no highlight, the label says it's playing
-                .padding(.top, -6)
+            TrackRow(track: tracks[current ?? 0], state: .next, episode: details?.episodePath, note: true)   // .next: no highlight, the ♫ says it's playing
+                .padding(.top, 4)   // even with the 18pt above the rule
+                .contentShape(.rect).onTapGesture(perform: openTracklist)
         }
     }
 }
@@ -1674,8 +1667,10 @@ struct TrackRow: View {
     enum State { case past, now, next }
     let track: Track, state: State
     var episode: String?   // shows/x/episodes/y, for saving the track
+    var note = false   // ♫ before the track (Now Playing); no SF Symbol has beamed eighth notes
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
+            if note { Text("♫").font(.system(size: 20)).frame(height: 30) }
             VStack(alignment: .leading, spacing: 1) {
                 Text((track.artist ?? "").nts).font(.nts(12)).lineLimit(1)
                 Text(track.title ?? "").font(.system(size: 12)).opacity(0.75).lineLimit(1)
