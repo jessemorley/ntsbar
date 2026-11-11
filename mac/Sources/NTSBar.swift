@@ -119,10 +119,10 @@ extension Saved {
     }
 }
 
-enum SavedTab: String, CaseIterable { case hosts, episodes, history }
+enum SavedTab: String, CaseIterable { case hosts, episodes, tracks, history }
 
-/// One lazily paged list from the account.
-struct Feed { var items: [Saved] = [], cursor: Any? = nil, done = false, loading = false }
+/// One lazily paged list from the account (tracks fill `tracks`, the rest `items`).
+struct Feed { var items: [Saved] = [], tracks: [Track] = [], cursor: Any? = nil, done = false, loading = false }
 
 // MARK: - NTS account
 // nts.live signs in with Firebase Auth (project nts-ios-app) and reads My NTS through callable
@@ -601,16 +601,26 @@ enum Keychain {
                 case .hosts: ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
                 case .episodes: ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
                 case .history: ("getHistoryEpisodesEurope", ["lastPlayedAt": cursor], "last_played_at")
+                // ponytail: "createdBefore" is a guess from the created_before cursor; untested, the account has under one 150-track page
+                case .tracks: ("getMyTracksEurope", ["createdBefore": cursor], "created_before")
                 }
                 let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
                 let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
-                var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
-                let items = (r["results"] as? [[String: Any]] ?? []).compactMap { $0["article"] as? [String: Any] }
-                    .map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
-                feeds[tab]?.items += items
+                let results = r["results"] as? [[String: Any]] ?? []
+                if tab == .tracks {
+                    let tracks = results.map { Track(uid: $0["track_uid"] as? String, artist: ($0["artist_names"] as? [String])?.joined(separator: ", "),
+                                                     title: $0["song_title"] as? String) }
+                    feeds[tab]?.tracks += tracks
+                    savedTracks.formUnion(tracks.compactMap(\.uid))   // so their ⋯ menus offer Remove
+                    added = tracks.count
+                } else {
+                    var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
+                    let items = results.compactMap { $0["article"] as? [String: Any] }.map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
+                    feeds[tab]?.items += items
+                    added = items.count
+                }
                 feeds[tab]?.cursor = meta[next]
                 feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
-                added = items.count
             } while added == 0 && feeds[tab]?.done == false
             problem = nil
         } catch { report(error) }
@@ -719,6 +729,17 @@ let bannerHeight: CGFloat = 221   // NowHeader artwork
 func hhmm(_ d: Date) -> String {
     d.formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
                           timeZone: .current, calendar: .current))
+}
+
+/// "13:00 - 14:00"
+func hours(_ start: Date, _ end: Date) -> String { "\(hhmm(start)) - \(hhmm(end))" }
+
+/// Playback position, e.g. 0:19:23
+func clock(_ s: Double) -> String { Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
+
+extension ScrollGeometry {
+    /// How far the content has scrolled from its top.
+    var scrolled: CGFloat { contentOffset.y + contentInsets.top }
 }
 
 extension String {
@@ -869,7 +890,7 @@ struct ChannelCard: View {
                     .lineLimit(3).fixedSize(horizontal: false, vertical: true)
                     .padding(.top, 5)
                 if let end = channel.now.endTimestamp {
-                    Text("\(hhmm(channel.now.startTimestamp)) - \(hhmm(end))".nts)
+                    Text(hours(channel.now.startTimestamp, end).nts)
                         .font(.nts(12.5)).padding(.top, 5)
                 }
                 Spacer(minLength: 0)
@@ -995,7 +1016,7 @@ struct SavedView: View {
     /// Signed in: the account's lists, paged in. Signed out: the local saves.
     var items: [Saved] {
         if store.email != nil { return store.feeds[tab]?.items ?? [] }
-        return tab == .history ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
+        return tab == .history || tab == .tracks ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
     }
 
     var body: some View {
@@ -1030,23 +1051,33 @@ struct SavedView: View {
             .animation(.easeOut(duration: 0.08), value: collapsed)   // overrides the slower withAnimation below
             .frame(height: collapsed ? 0 : titleHeight, alignment: .top).clipped()
             HStack(spacing: 0) {
+                // near-justified, as on iPhone: first flush left, last flush right, even gaps between
                 ForEach(SavedTab.allCases, id: \.self) { t in
+                    if t != SavedTab.allCases.first { Spacer(minLength: 0) }
                     Button { tab = t } label: {
-                        Text(t.rawValue.nts).font(.nts(14))
-                            .frame(maxWidth: .infinity, minHeight: 36).contentShape(.rect)
+                        Text(t.rawValue.nts).font(.nts(12.5))
+                            .frame(minHeight: 36).contentShape(.rect)
                             .opacity(tab == t ? 1 : 0.45)
                     }
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, pageInset + 4)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     if store.email == nil { AccountView() }
                     let loading = store.feeds[tab]?.loading == true
-                    if tab == .history && store.email == nil {
-                        empty("SIGN IN FOR HISTORY")
-                    } else if items.isEmpty && !loading {
+                    let tracks = (store.feeds[.tracks]?.tracks ?? []).filter { store.savedTracks.contains($0.uid ?? "") }   // removed ones drop out
+                    if (tab == .history || tab == .tracks) && store.email == nil {
+                        empty("SIGN IN FOR \(tab.rawValue.uppercased())")
+                    } else if (tab == .tracks ? tracks.isEmpty : items.isEmpty) && !loading {
                         empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
+                    }
+                    if tab == .tracks {
+                        ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
+                            TrackRow(track: t, state: .next)
+                                .onAppear { if i == tracks.count - 1 { Task { await store.loadMore(.tracks) } } }
+                        }
                     }
                     ForEach(items) { s in
                         SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
@@ -1056,7 +1087,7 @@ struct SavedView: View {
                     if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
-            .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y + $0.contentInsets.top } action: { _, y in
+            .onScrollGeometryChange(for: CGFloat.self) { $0.scrolled } action: { _, y in
                 // hysteresis: the list grows as the title leaves, which can nudge the offset back near the end
                 if y > 50 && !collapsed || y < 20 && collapsed { withAnimation(.easeOut(duration: 0.12)) { collapsed.toggle() } }   // the gap and tabs (a local .animation wouldn't move the tabs)
             }
@@ -1262,7 +1293,7 @@ struct ShowView: View {
             // the bar (41pt) appears as its bottom meets the title's top (~bannerHeight + 39: location line + gaps),
             // its name fades in once the title's first line is almost covered
             .onScrollGeometryChange(for: Int.self) { g in
-                let y = g.contentOffset.y + g.contentInsets.top
+                let y = g.scrolled
                 return y > bannerHeight + 18 ? 2 : y > bannerHeight - 2 ? 1 : 0
             } action: { bar = $1 }
             .task { info = try? await fetchOne(String(show.id.dropFirst())) }
@@ -1371,13 +1402,12 @@ struct MiniPlayer: View {
         let id = store.playingID
         if let c = store.live.first(where: { $0.id == id }) {
             let b = c.now
-            return (b.embeds?.details?.media?.thumb, b.title, b.endTimestamp.map { "\(hhmm(b.startTimestamp)) - \(hhmm($0))" } ?? "")
+            return (b.embeds?.details?.media?.thumb, b.title, b.endTimestamp.map { hours(b.startTimestamp, $0) } ?? "")
         }
         if let m = store.mixtapes.first(where: { $0.id == id }) {
             return (m.media?.thumb, m.title, store.mixtapeNow?.title ?? m.subtitle)
         }
         if let e = store.episode, e.id == id {
-            let clock = { (s: Double) in Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
             return (e.details.media?.thumb, e.details.name ?? "", "\(clock(store.position)) / \(clock(store.duration))")
         }
         return (nil, "", "")
@@ -1523,8 +1553,6 @@ struct EpisodeNowView: View {
         }
         .task(id: path) { await store.loadTracklist(path) }
     }
-
-    func clock(_ s: Double) -> String { Duration.seconds(max(0, s)).formatted(.time(pattern: .hourMinuteSecond)) }
 }
 
 struct ChannelNowView: View {
@@ -1551,7 +1579,7 @@ struct ChannelNowView: View {
                         }
                         .overlay(alignment: .top) { PlayOverlay() }
                         HStack {
-                            Text("\(hhmm(b.startTimestamp)) - \(hhmm(end))".nts)
+                            Text(hours(b.startTimestamp, end).nts)
                             Spacer()
                             Text("\(Int(end.timeIntervalSince(ctx.date) / 60)) MIN LEFT".nts).opacity(0.6)
                         }
@@ -1650,7 +1678,7 @@ struct TracklistView: View {
                     .padding(.vertical, 6)
                 }
                 .scrollBounceBehavior(.basedOnSize)
-                .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 0.5 } action: { scrolled = $1 }
+                .onScrollGeometryChange(for: Bool.self) { $0.scrolled > 0.5 } action: { scrolled = $1 }
                 .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { listHeight = $1 }
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
@@ -1666,8 +1694,9 @@ struct TrackMenu: View {
     var body: some View {
         let text = [track.artist, track.title].compactMap { $0 }.joined(separator: " - ")
         Menu {
-            if store.email != nil, let uid = track.uid, let episode {
-                Button(store.savedTracks.contains(uid) ? "Remove Track" : "Save Track") { store.toggleTrack(track, episode: episode) }
+            // saving needs the episode; removing (My NTS tracks, which come without one) only the uid
+            if store.email != nil, let uid = track.uid, episode != nil || store.savedTracks.contains(uid) {
+                Button(store.savedTracks.contains(uid) ? "Remove Track" : "Save Track") { store.toggleTrack(track, episode: episode ?? "") }
             }
             Button("Copy") { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string) }
             Button("Search on Spotify") {
