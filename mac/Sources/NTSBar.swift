@@ -714,6 +714,7 @@ struct Cover: View {
 let cardHeight: CGFloat = 326
 let contentHeight = cardHeight * 2
 let pageInset: CGFloat = 10   // page margin below artwork
+let bannerHeight: CGFloat = 221   // NowHeader artwork
 
 func hhmm(_ d: Date) -> String {
     d.formatted(.verbatim("\(hour: .twoDigits(clock: .twentyFourHour, hourCycle: .zeroBased)):\(minute: .twoDigits)",
@@ -1075,24 +1076,14 @@ struct EpisodeRow: View {
         HStack(alignment: .top, spacing: 10) {
             Cover(url: (isEpisode ? d.media?.wide : d.media?.square) ?? image).frame(width: isEpisode ? 148 : 93, height: 93)
                 .overlay(alignment: .bottomLeading) {
-                    if isEpisode { Group {
-                        if store.waiting(id) { Spinner().frame(width: 15, height: 17) }
-                        else if store.playingID == id && !store.paused { PauseIcon().frame(width: 13, height: 15) }
-                        else { Triangle().frame(width: 15, height: 17) }
-                    }
-                    .frame(width: 49, height: 45).background(.black.opacity(0.75)) }
+                    if isEpisode { playIcon(id, 15, 17).frame(width: 49, height: 45).background(.black.opacity(0.75)) }
                 }
             VStack(alignment: .leading, spacing: 4) {
                 Text((d.name ?? "").nts).font(.nts(14)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
                 if !isEpisode {   // shows: ▶ newest episode + grey "Last episode", only the age bold, on the artwork's bottom edge
                     HStack(spacing: 1) {
                         Button { Task { await playLatest() } } label: {
-                            Group {
-                                if let l = latest, store.waiting(l) { Spinner().frame(width: 10, height: 12) }
-                                else if let l = latest, store.playingID == l && !store.paused { PauseIcon().frame(width: 9, height: 11) }
-                                else { Triangle().frame(width: 10, height: 12) }
-                            }
-                            .frame(width: 20, height: 20).contentShape(.rect)
+                            playIcon(latest, 10, 12).frame(width: 20, height: 20).contentShape(.rect)
                         }
                         .buttonStyle(.plain)
                         if date.hasPrefix("Last episode ") {
@@ -1104,13 +1095,13 @@ struct EpisodeRow: View {
                     .frame(maxHeight: .infinity, alignment: .bottomLeading)
                 } else {
                     Text(date.nts).font(.nts(11, .regular))
-                // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
-                ViewThatFits(in: .vertical) {
-                    ForEach((0...tags.count).reversed(), id: \.self) { n in
-                        Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: tag) }.padding(.top, 4).padding(.trailing, 26)
+                    // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
+                    ViewThatFits(in: .vertical) {
+                        ForEach((0...tags.count).reversed(), id: \.self) { n in
+                            Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: tag) }.padding(.top, 4).padding(.trailing, 26)
+                        }
                     }
-                }
-                .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
+                    .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
                 }
             }
         }
@@ -1128,6 +1119,13 @@ struct EpisodeRow: View {
         .padding(.horizontal, pageInset).padding(.vertical, 10)
         .contentShape(.rect)
         .onTapGesture { if isEpisode { Task { await store.playEpisode(id) } } else { open() } }
+    }
+
+    /// Spinner while `episode` loads, pause while it plays, else play; `w`×`h` is the triangle's size.
+    @ViewBuilder func playIcon(_ episode: String?, _ w: CGFloat, _ h: CGFloat) -> some View {
+        if let e = episode, store.waiting(e) { Spinner().frame(width: w, height: h) }
+        else if let e = episode, store.playingID == e && !store.paused { PauseIcon().frame(width: w - 2, height: h - 2) }
+        else { Triangle().frame(width: w, height: h) }
     }
 
     func playLatest() async {
@@ -1183,8 +1181,7 @@ struct ShowView: View {
     @State private var done = false
     @State private var loading = false
     @State private var info: Details?   // the show itself: banner, location, frequency, description
-    @State private var barShown = false    // artwork scrolled under the bar: back bar appears
-    @State private var titleGone = false   // then the banner's title scrolls out: the bar's title fades in
+    @State private var bar = 0   // back bar: 0 hidden, 1 shown, 2 with the show name
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1222,13 +1219,13 @@ struct ShowView: View {
                 }
             }
             .overlay(alignment: .top) {
-                if barShown {
+                if bar > 0 {
                     VStack(spacing: 0) {
                         Button(action: back) {
                             HStack(spacing: 0) {
                                 Image(systemName: "chevron.left").font(.nts(15)).frame(width: 36, height: 40)
                                 Text((info?.name ?? show.title).nts).font(.nts(14)).lineLimit(1)
-                                    .opacity(titleGone ? 1 : 0).animation(.easeOut(duration: 0.15), value: titleGone)
+                                    .opacity(bar == 2 ? 1 : 0).animation(.easeOut(duration: 0.15), value: bar)
                                 Spacer(minLength: 0)
                             }
                             .padding(.trailing, pageInset).contentShape(.rect)
@@ -1239,8 +1236,12 @@ struct ShowView: View {
                     .background(.black)
                 }
             }
-            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 221 - 2 } action: { barShown = $1 }   // bar as its bottom (41pt) meets the title's top (~260: artwork 221 + location line + gaps)
-            .onScrollGeometryChange(for: Bool.self) { $0.contentOffset.y + $0.contentInsets.top > 221 + 18 } action: { titleGone = $1 }   // its name fades in as the bar has almost covered the title's first line
+            // the bar (41pt) appears as its bottom meets the title's top (~bannerHeight + 39: location line + gaps),
+            // its name fades in once the title's first line is almost covered
+            .onScrollGeometryChange(for: Int.self) { g in
+                let y = g.contentOffset.y + g.contentInsets.top
+                return y > bannerHeight + 18 ? 2 : y > bannerHeight - 2 ? 1 : 0
+            } action: { bar = $1 }
             .task { info = try? await fetchOne(String(show.id.dropFirst())) }
             .task { await loadMore() }
         }
@@ -1319,7 +1320,7 @@ struct NowHeader<Badge: View, Accessory: View>: View {
     @ViewBuilder let accessory: Accessory
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Cover(url: image).frame(height: 221)
+            Cover(url: image).frame(height: bannerHeight)
                 .overlay {
                     if let video {
                         // fades into the page like the NTS iPhone mixtape page
