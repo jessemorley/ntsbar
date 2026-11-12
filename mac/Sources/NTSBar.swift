@@ -954,7 +954,7 @@ struct RootView: View {
                 .buttonStyle(.plain)
             }
         }
-        .overlay(alignment: .bottom) { if page != .saved { Rectangle().fill(.white.opacity(0.45)).frame(height: 1) } }   // My NTS's own tab row follows straight on
+        .overlay(alignment: .bottom) { if page != .saved { Rectangle().fill(.white.opacity(0.75)).frame(height: 1) } }   // My NTS's own tab row follows straight on
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
