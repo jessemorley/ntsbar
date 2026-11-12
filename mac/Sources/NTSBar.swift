@@ -119,10 +119,10 @@ extension Saved {
     }
 }
 
-enum SavedTab: String, CaseIterable { case hosts, episodes, tracks, history }
+enum SavedTab: String, CaseIterable { case hosts, episodes, history }
 
-/// One lazily paged list from the account (tracks fill `tracks`, the rest `items`).
-struct Feed { var items: [Saved] = [], tracks: [Track] = [], cursor: Any? = nil, done = false, loading = false }
+/// One lazily paged list from the account.
+struct Feed { var items: [Saved] = [], cursor: Any? = nil, done = false, loading = false }
 
 // MARK: - NTS account
 // nts.live signs in with Firebase Auth (project nts-ios-app) and reads My NTS through callable
@@ -633,24 +633,14 @@ enum Keychain {
                 case .hosts: ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
                 case .episodes: ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
                 case .history: ("getHistoryEpisodesEurope", ["lastPlayedAt": cursor], "last_played_at")
-                // ponytail: "createdBefore" is a guess from the created_before cursor; untested, the account has under one 150-track page
-                case .tracks: ("getMyTracksEurope", ["createdBefore": cursor], "created_before")
                 }
                 let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
                 let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
                 let results = r["results"] as? [[String: Any]] ?? []
-                if tab == .tracks {
-                    let tracks = results.map { Track(uid: $0["track_uid"] as? String, artist: ($0["artist_names"] as? [String])?.joined(separator: ", "),
-                                                     title: $0["song_title"] as? String) }
-                    feeds[tab]?.tracks += tracks
-                    savedTracks.formUnion(tracks.compactMap(\.uid))   // so their ⋯ menus offer Remove
-                    added = tracks.count
-                } else {
-                    var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
-                    let items = results.compactMap { $0["article"] as? [String: Any] }.map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
-                    feeds[tab]?.items += items
-                    added = items.count
-                }
+                var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
+                let items = results.compactMap { $0["article"] as? [String: Any] }.map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
+                feeds[tab]?.items += items
+                added = items.count
                 feeds[tab]?.cursor = meta[next]
                 feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
             } while added == 0 && feeds[tab]?.done == false
@@ -791,9 +781,9 @@ extension String {
 }
 
 enum Page { case live, nowPlaying, mixtapes, saved
-    /// The tab bar: page, label, icon. Now Playing isn't a tab; the mini player opens it.
+    /// The tab bar: page, label, icon. The mini player opens Now Playing too.
     static let tabs: [(page: Page, label: String, icon: String)] = [
-        (.live, "LIVE", "antenna.radiowaves.left.and.right"), (.mixtapes, "MIXTAPES", "infinity"), (.saved, "MY NTS", "person"),
+        (.live, "LIVE", "antenna.radiowaves.left.and.right"), (.nowPlaying, "NOW PLAYING", "waveform"), (.mixtapes, "MIXTAPES", "infinity"), (.saved, "MY NTS", "person"),
     ]
 }
 
@@ -854,12 +844,6 @@ extension EnvironmentValues {
     @Entry var tabBar = TabBarInset()
 }
 
-/// My NTS's title height: its header slides up over the app's tab bar, which is cut off at the header's top edge.
-struct CoversTabs: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
 /// What's playing as a 2pt line along the mini player's top edge:
 /// live show or archive episode progress; solid for mixtapes. Archive episodes: thickens on hover, drag to seek.
 struct ProgressLine: View {
@@ -903,7 +887,6 @@ struct RootView: View {
     @State var page = Page.live
     @State private var tabsHidden = false
     @State private var tabsHeight: CGFloat = 54
-    @State private var coverTitle: CGFloat = 0   // My NTS's title height, while its header is on screen
     @State private var back = Page.live   // where the mini player returns to from Now Playing
     var mini: Bool { store.playingID != nil }
     /// The page runs under the tab bar; the mini player takes its share.
@@ -926,7 +909,6 @@ struct RootView: View {
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
             // pages without HidesTabs (all but My NTS) report false, so switching pages brings the bar back
             .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
-            .onPreferenceChange(CoversTabs.self) { coverTitle = $0 }
             .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
             .clipped()   // the bar slides up out of the window
             if mini {
@@ -940,7 +922,10 @@ struct RootView: View {
     var tabs: some View {
         HStack(spacing: 0) {
             ForEach(Page.tabs, id: \.page) { t in
-                Button { page = t.page } label: {
+                Button {
+                    if t.page == .nowPlaying && page != .nowPlaying { back = page }   // the mini player's chevron returns here
+                    page = t.page
+                } label: {
                     VStack(spacing: 4) {
                         Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
                         Text(t.label.nts).font(.nts(10))
@@ -951,18 +936,13 @@ struct RootView: View {
                 .buttonStyle(.plain)
             }
         }
+        .overlay(alignment: .bottom) { Divider() }
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
         .background(.black)   // after the fade: a fading background would flash the list beneath
         .offset(y: tabsHidden ? -tabsHeight : 0)   // slides up out of view
         .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top)
-        .mask(alignment: .top) {
-            // only what's above My NTS's header, which travels from below the bar to a title's height above the top,
-            // on the same animation: the header seems to slide over the bar
-            let edge = coverTitle > 0 && tabsHidden ? -coverTitle : tabsHeight
-            Rectangle().frame(height: 200).offset(y: edge - 200)
-        }
     }
 
     @ViewBuilder var problem: some View {
@@ -1147,7 +1127,7 @@ struct SavedView: View {
     /// Signed in: the account's lists, paged in. Signed out: the local saves.
     var items: [Saved] {
         if store.email != nil { return store.feeds[tab]?.items ?? [] }
-        return tab == .history || tab == .tracks ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
+        return tab == .history ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
     }
 
     var body: some View {
@@ -1155,51 +1135,37 @@ struct SavedView: View {
     }
 
     @Environment(\.tabBar) var tabBar
-    @State private var titleHeight: CGFloat = 58
-    @State private var headerHeight: CGFloat = 112
-    var collapsed: Bool { !tabBar.shown }   // the title row leaves with the app's tabs
-    /// Title and tabs float over the list, as the app's tabs do, so the list never resizes.
+    @State private var headerHeight: CGFloat = 48
+    /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
-        VStack(spacing: 0) {
-            HStack {   // as on the iPhone app; the account menu replaces the old footer
-                Text("MY NTS".nts).font(.nts(32))
-                Spacer()
-                Menu {
-                    if let e = store.email {
-                        Text(e)
-                        Button("Sign Out") { store.signOut() }
-                        Divider()
-                    }
-                    Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
-                } label: {
-                    Image(systemName: "person.crop.circle.fill").font(.system(size: 24))
+        HStack(spacing: 0) {
+            // near-justified, as on iPhone: first flush left, the account menu flush right, even gaps between
+            ForEach(SavedTab.allCases, id: \.self) { t in
+                Button { tab = t } label: {
+                    Text(t.rawValue.nts).font(.nts(12.5))
+                        .frame(minHeight: 36).contentShape(.rect)
+                        .opacity(tab == t ? 1 : 0.45)
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
-                .scaleEffect(1.8)   // ponytail: the menu button draws its label at control size, ignoring .font; scaled up to the iPhone's ~24pt
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
             }
-            .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
-            .fixedSize(horizontal: false, vertical: true)
-            .measureHeight($titleHeight)
-            // title and icon flick out fast; the header slides up a beat slower (the app's 0.12s), carrying the tabs
-            .opacity(collapsed ? 0 : 1).animation(.easeOut(duration: 0.08), value: collapsed)
-            HStack(spacing: 0) {
-                // near-justified, as on iPhone: first flush left, last flush right, even gaps between
-                ForEach(SavedTab.allCases, id: \.self) { t in
-                    if t != SavedTab.allCases.first { Spacer(minLength: 0) }
-                    Button { tab = t } label: {
-                        Text(t.rawValue.nts).font(.nts(12.5))
-                            .frame(minHeight: 36).contentShape(.rect)
-                            .opacity(tab == t ? 1 : 0.45)
-                    }
-                    .buttonStyle(.plain)
+            Menu {
+                if let e = store.email {
+                    Text(e)
+                    Button("Sign Out") { store.signOut() }
+                    Divider()
                 }
+                Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
+            } label: {
+                Image(systemName: "person.crop.circle.fill")
             }
-            .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
         }
+        .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($headerHeight)
         .background(.black)
-        .offset(y: tabBar.visible - (collapsed ? titleHeight : 0))
+        .offset(y: tabBar.visible)
     }
 
     var lists: some View {
@@ -1207,17 +1173,10 @@ struct SavedView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if store.email == nil { AccountView() }
                 let loading = store.feeds[tab]?.loading == true
-                let tracks = (store.feeds[.tracks]?.tracks ?? []).filter { store.savedTracks.contains($0.uid ?? "") }   // removed ones drop out
-                if (tab == .history || tab == .tracks) && store.email == nil {
-                    empty("SIGN IN FOR \(tab.rawValue.uppercased())")
-                } else if (tab == .tracks ? tracks.isEmpty : items.isEmpty) && !loading {
+                if tab == .history && store.email == nil {
+                    empty("SIGN IN FOR HISTORY")
+                } else if items.isEmpty && !loading {
                     empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
-                }
-                if tab == .tracks {
-                    ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
-                        TrackRow(track: t, state: .next)
-                            .onAppear { if i == tracks.count - 1 { Task { await store.loadMore(.tracks) } } }
-                    }
                 }
                 ForEach(items) { s in
                     SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
@@ -1229,7 +1188,6 @@ struct SavedView: View {
         }
         .modifier(HidesTabs(extra: headerHeight))
         .overlay(alignment: .top) { header }
-        .preference(key: CoversTabs.self, value: titleHeight)
         .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
     }
 
