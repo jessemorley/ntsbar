@@ -30,6 +30,9 @@ struct Broadcast: Decodable {
     var broadcastTitle: String, startTimestamp: Date, endTimestamp: Date?
     // API titles carry HTML entities (e.g. &amp;)
     var title: String { broadcastTitle.htmlDecoded }
+    /// Reruns end " (R)"; the big titles drop it for the ReplayIcon, as on iPhone (small text keeps it).
+    var isReplay: Bool { title.hasSuffix(" (R)") }
+    var bareTitle: String { isReplay ? String(title.dropLast(4)) : title }
     var embeds: Embeds?
     struct Embeds: Decodable { var details: Details? }
 }
@@ -119,10 +122,10 @@ extension Saved {
     }
 }
 
-enum SavedTab: String, CaseIterable { case hosts, episodes, tracks, history }
+enum SavedTab: String, CaseIterable { case hosts, episodes, history }
 
-/// One lazily paged list from the account (tracks fill `tracks`, the rest `items`).
-struct Feed { var items: [Saved] = [], tracks: [Track] = [], cursor: Any? = nil, done = false, loading = false }
+/// One lazily paged list from the account.
+struct Feed { var items: [Saved] = [], cursor: Any? = nil, done = false, loading = false }
 
 // MARK: - NTS account
 // nts.live signs in with Firebase Auth (project nts-ios-app) and reads My NTS through callable
@@ -195,6 +198,7 @@ enum Keychain {
 @Observable @MainActor final class Store {
     var live: [Channel] = []
     var mixtapes: [Mixtape] = []
+    var mixtapeVideos: [String: URL] = [:]   // cached hover loops, by mixtape id
     var playingID: String?
     var mixtapeNow: (title: String, path: String?)?   // the episode the playing mixtape is on
     var error: String?
@@ -213,11 +217,13 @@ enum Keychain {
     func waiting(_ id: String) -> Bool { pendingID == id || (playingID == id && buffering) }
     var position: Double { seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0) }
     var seekTarget: Double?   // held while a seek is in flight, so the tracklist highlight jumps straight there
-    var duration: Double { player.currentItem.map { $0.duration.seconds.isFinite ? $0.duration.seconds : 0 } ?? 0 }
+    var duration: Double = 0   // stored, not read off the player: views must see it arrive (the mini player's seek bar)
 
     var email = UserDefaults.standard.string(forKey: "email")   // signed-in NTS account
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
     var problem: String?
+    var streamError: String?   // shown in the mini player while the failed item sits paused
+    var showTracklist = false   // Now Playing shows the tracklist in place of the episode page (the mini player's track opens it)
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
@@ -231,14 +237,32 @@ enum Keychain {
                 try? await Task.sleep(for: .seconds(min(60, ends.min() ?? 60)))
             }
         }
-        Task { mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow() }
+        Task {
+            mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow()
+            // the tiles' 120px hover loops (~4 MB in all), kept on disk so hover plays at once
+            let dir = URL.cachesDirectory.appending(path: "NTSBar/mixtape-videos")   // NTSBar/ itself is URLSession's cache
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for m in mixtapes {
+                guard let remote = m.media?.animationThumb.flatMap(URL.init) else { continue }
+                let file = dir.appending(path: remote.lastPathComponent)   // names carry a content hash
+                if !FileManager.default.fileExists(atPath: file.path),
+                   let (tmp, _) = try? await URLSession.shared.download(from: remote) { try? FileManager.default.moveItem(at: tmp, to: file) }
+                if FileManager.default.fileExists(atPath: file.path) { mixtapeVideos[m.id] = file }
+            }
+        }
         Task {
             // ponytail: polls every 30s; nts.live uses a Firestore onSnapshot listener, switch if the lag shows
             while true { await refreshMixtapeNow(); try? await Task.sleep(for: .seconds(30)) }
         }
         statusObserver = observeStatus()
+        itemObserver = observeItem()
         Task {
             for await _ in NotificationCenter.default.notifications(named: AVPlayerItem.didPlayToEndTimeNotification).map({ _ in () }) { ended() }
+        }
+        Task {   // mid-play failures (connection dropped); the background video's looper posts these too, hence the item check
+            for await (item, why) in NotificationCenter.default.notifications(named: AVPlayerItem.failedToPlayToEndTimeNotification)
+                .map({ (($0.object as? AVPlayerItem).map(ObjectIdentifier.init),($0.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription) })
+            where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
         if !CommandLine.arguments.contains("--snapshot") { remoteCommands() }
     }
@@ -249,7 +273,9 @@ enum Keychain {
         if playingID == id { if paused { pauseResume() } else { stop() }; return }
         guard let u = URL(string: url) else { return }
         listenStop()
+        streamError = nil
         streamURL = u
+        duration = 0
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
         player.play()
         playingID = id
@@ -260,6 +286,7 @@ enum Keychain {
 
     @ObservationIgnored private var streamURL: URL?
     @ObservationIgnored private var statusObserver: NSKeyValueObservation?
+    @ObservationIgnored private var itemObserver: NSKeyValueObservation?
 
     /// KVO, not publisher(for:).values: that async sequence drops changes emitted between awaits.
     /// nonisolated so the off-main KVO closure doesn't inherit @MainActor and trap.
@@ -268,6 +295,23 @@ enum Keychain {
             let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate, playing = p.timeControlStatus == .playing && p.currentItem?.status == .readyToPlay   // switching items briefly reports .playing for the old one
             Task { @MainActor in self?.buffering = waiting; if playing { self?.pendingID = nil } }
         }
+    }
+
+    /// Item can't open (bad URL, expired certificate, 404): status goes .failed.
+    nonisolated private func observeItem() -> NSKeyValueObservation {
+        player.observe(\.currentItem?.status) { [weak self] p, _ in
+            guard let item = p.currentItem, item.status == .failed else { return }
+            let why = item.error?.localizedDescription   // e.g. "The certificate for this server is invalid."
+            Task { @MainActor in self?.streamFailed(why) }
+        }
+    }
+
+    /// Leaves the item in the mini player, paused, with the reason in place of its subtitle; play retries.
+    func streamFailed(_ why: String?) {
+        guard playingID != nil else { return }
+        listenStop(); player.pause(); paused = true; pendingID = nil
+        streamError = "Can't play stream" + (why.map { ". \($0)" } ?? "")
+        nowPlaying()
     }
 
     func refreshMixtapeNow() async {
@@ -284,9 +328,10 @@ enum Keychain {
     func pauseResume() {
         defer { nowPlaying() }
         if !paused { listenStop(); player.pause() }
-        else if episode?.id == playingID { player.play(); paused = false; listenStart(); return }
+        else if episode?.id == playingID && streamError == nil { player.play(); paused = false; listenStart(); return }   // ponytail: a failed episode retries from the start, seek back if that annoys
         else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
         paused.toggle()
+        streamError = nil
     }
 
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
@@ -302,7 +347,11 @@ enum Keychain {
             toggle(id, hls.absoluteString)
             listenStart()
             if let item = player.currentItem {   // HLS duration arrives once the playlist loads
-                Task { for await _ in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values { nowPlaying() } }
+                Task {
+                    for await d in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values where player.currentItem === item {
+                        duration = d.seconds.isFinite ? d.seconds : 0; nowPlaying()
+                    }
+                }
             }
             problem = nil
         } catch { if pendingID == id { pendingID = nil }; report(error) }
@@ -601,24 +650,14 @@ enum Keychain {
                 case .hosts: ("getShowFavouritesEurope", ["order_by": "broadcast_date", "order_direction": "desc", "paginate": true, "cursor": cursor], "next_cursor")
                 case .episodes: ("getBookmarkedEpisodesEurope", ["lastCreatedAt": cursor], "last_created_at")
                 case .history: ("getHistoryEpisodesEurope", ["lastPlayedAt": cursor], "last_played_at")
-                // ponytail: "createdBefore" is a guess from the created_before cursor; untested, the account has under one 150-track page
-                case .tracks: ("getMyTracksEurope", ["createdBefore": cursor], "created_before")
                 }
                 let r = (try await post("\(functions)/\(fn)", ["data": args], token: t) as? [String: Any])?["result"] as? [String: Any] ?? [:]
                 let meta = (r["metadata"] as? [String: Any])?["resultset"] as? [String: Any] ?? [:]
                 let results = r["results"] as? [[String: Any]] ?? []
-                if tab == .tracks {
-                    let tracks = results.map { Track(uid: $0["track_uid"] as? String, artist: ($0["artist_names"] as? [String])?.joined(separator: ", "),
-                                                     title: $0["song_title"] as? String) }
-                    feeds[tab]?.tracks += tracks
-                    savedTracks.formUnion(tracks.compactMap(\.uid))   // so their ⋯ menus offer Remove
-                    added = tracks.count
-                } else {
-                    var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
-                    let items = results.compactMap { $0["article"] as? [String: Any] }.map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
-                    feeds[tab]?.items += items
-                    added = items.count
-                }
+                var seen = Set(feeds[tab]?.items.map(\.id) ?? [])   // history repeats replayed episodes, even within a page
+                let items = results.compactMap { $0["article"] as? [String: Any] }.map(Saved.init(article:)).filter { seen.insert($0.id).inserted }
+                feeds[tab]?.items += items
+                added = items.count
                 feeds[tab]?.cursor = meta[next]
                 feeds[tab]?.done = meta["is_final_page"] as? Bool ?? true || meta[next] == nil || meta[next] is NSNull
             } while added == 0 && feeds[tab]?.done == false
@@ -715,7 +754,8 @@ struct Cover: View {
     let url: URL?
     var body: some View {
         Color(white: 0.12)
-            .overlay { AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear } }
+            // .clipped() hides the fill's overflow but it still takes clicks (e.g. a card's image over the play button above it)
+            .overlay { AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear }.allowsHitTesting(false) }
             .clipped()
     }
 }
@@ -758,19 +798,21 @@ extension String {
 }
 
 enum Page { case live, nowPlaying, mixtapes, saved
-    /// The tab bar: page, label, icon. Now Playing isn't a tab; the mini player opens it.
+    /// The tab bar: page, label, icon. The mini player opens Now Playing too.
     static let tabs: [(page: Page, label: String, icon: String)] = [
-        (.live, "LIVE", "antenna.radiowaves.left.and.right"), (.mixtapes, "MIXTAPES", "infinity"), (.saved, "MY NTS", "person"),
+        (.live, "LIVE", "antenna.radiowaves.left.and.right"), (.nowPlaying, "NOW PLAYING", "waveform"), (.mixtapes, "MIXTAPES", "infinity"), (.saved, "MY NTS", "person"),
     ]
 }
 
-/// A bright band sweeping across the divider while audio loads.
+/// A soft glow easing across the progress line while audio loads.
 struct Shimmer: View {
     var body: some View {
         TimelineView(.animation) { ctx in
-            let x = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.2) / 1.2 * 480 - 120
-            LinearGradient(colors: [.clear, .white, .clear], startPoint: .leading, endPoint: .trailing)
-                .frame(width: 120).offset(x: x)
+            let t = ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.6) / 1.6
+            let e = t * t * (3 - 2 * t)   // smoothstep: eases in and out at the ends
+            LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .white.opacity(0.9), location: 0.5),
+                                   .init(color: .clear, location: 1)], startPoint: .leading, endPoint: .trailing)
+                .frame(width: 180).offset(x: e * 540 - 180)
                 .frame(maxWidth: .infinity, alignment: .leading).clipped()
         }
     }
@@ -819,17 +861,12 @@ extension EnvironmentValues {
     @Entry var tabBar = TabBarInset()
 }
 
-/// My NTS's title height: its header slides up over the app's tab bar, which is cut off at the header's top edge.
-struct CoversTabs: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-
-/// What's playing as a 1pt line (the mini player's divider, the foot of the Now Playing artwork):
-/// live show or archive episode progress; solid for mixtapes. Archive episodes: a handle on hover, drag to seek.
+/// What's playing as a 2pt line along the mini player's top edge:
+/// live show or archive episode progress; solid for mixtapes. Archive episodes: thickens on hover, drag to seek.
 struct ProgressLine: View {
     @Environment(Store.self) var store
     @State private var hover = false
+    static let width: CGFloat = 358   // the 360pt window less its border pixel each side
 
     func progress(at now: Date) -> Double {
         if store.seekable { return store.scrub ?? store.position / store.duration }
@@ -841,21 +878,21 @@ struct ProgressLine: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let f = progress(at: ctx.date)
-            Rectangle().fill(.white.opacity(store.loading ? 0.7 : 0.3)).frame(height: 1)   // loading: dimmer white under the shimmer
-                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : 360 * f) }
+            let grown = store.seekable && (hover || store.scrub != nil)   // seeking: the bar thickens, no knob
+            Rectangle().fill(.white.opacity(0.2))
+                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: store.loading ? 0 : Self.width * f) }
                 .overlay { if store.loading { Shimmer() } }
-                .overlay(alignment: .leading) {
-                    if store.seekable && (hover || store.scrub != nil) {
-                        Circle().fill(.white).frame(width: 10, height: 10).offset(x: 360 * f - 5)
-                    }
-                }
+                .frame(height: grown ? 5 : 2)
+                .frame(height: 2, alignment: .bottom)   // grows upward, past its 2pt slot
+                .animation(.spring(duration: 0.25), value: grown)
+                .padding(.horizontal, 1)   // clear of the window's border pixel
         }
         .overlay {
             if store.seekable {
                 Color.clear.frame(height: 14).contentShape(.rect)
                     .onHover { hover = $0 }
                     .gesture(DragGesture(minimumDistance: 0)
-                        .onChanged { store.scrub = min(1, max(0, $0.location.x / 360)) }
+                        .onChanged { store.scrub = min(1, max(0, ($0.location.x - 1) / Self.width)) }
                         .onEnded { _ in store.endScrub() })
             }
         }
@@ -867,8 +904,8 @@ struct RootView: View {
     @State var page = Page.live
     @State private var tabsHidden = false
     @State private var tabsHeight: CGFloat = 54
-    @State private var coverTitle: CGFloat = 0   // My NTS's title height, while its header is on screen
-    var mini: Bool { page != .nowPlaying && store.playingID != nil }
+    @State private var back = Page.live   // where the mini player returns to from Now Playing
+    var mini: Bool { store.playingID != nil }
     /// The page runs under the tab bar; the mini player takes its share.
     var pageHeight: CGFloat { tabsHeight + contentHeight - (mini ? miniHeight : 0) }
     var scrollsUnderTabs: Bool { page == .saved }   // only My NTS hides the bar; the rest start below it
@@ -889,17 +926,24 @@ struct RootView: View {
             .frame(minHeight: page == .nowPlaying ? nil : pageHeight, maxHeight: pageHeight, alignment: .top)
             // pages without HidesTabs (all but My NTS) report false, so switching pages brings the bar back
             .onPreferenceChange(ScrolledDown.self) { down in withAnimation(.easeOut(duration: 0.12)) { tabsHidden = down } }
-            .onPreferenceChange(CoversTabs.self) { coverTitle = $0 }
             .overlay(alignment: .top) { VStack(spacing: 0) { tabs; problem } }
             .clipped()   // the bar slides up out of the window
-            if mini { MiniPlayer { page = .nowPlaying } }
+            if mini {
+                MiniPlayer(expanded: page == .nowPlaying) {
+                    if page == .nowPlaying { page = back } else { back = page; page = .nowPlaying }
+                }
+            }
         }
+        .onChange(of: page) { if page != .nowPlaying { store.showTracklist = false } }   // Now Playing reopens on the episode
     }
 
     var tabs: some View {
         HStack(spacing: 0) {
             ForEach(Page.tabs, id: \.page) { t in
-                Button { page = t.page } label: {
+                Button {
+                    if t.page == .nowPlaying && page != .nowPlaying { back = page }   // the mini player's chevron returns here
+                    page = t.page
+                } label: {
                     VStack(spacing: 4) {
                         Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
                         Text(t.label.nts).font(.nts(10))
@@ -910,18 +954,13 @@ struct RootView: View {
                 .buttonStyle(.plain)
             }
         }
+        .overlay(alignment: .bottom) { if page != .saved { Rectangle().fill(.white.opacity(0.75)).frame(height: 1) } }   // My NTS's own tab row follows straight on
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
         .background(.black)   // after the fade: a fading background would flash the list beneath
         .offset(y: tabsHidden ? -tabsHeight : 0)   // slides up out of view
         .frame(height: tabsHidden ? 0 : tabsHeight, alignment: .top)
-        .mask(alignment: .top) {
-            // only what's above My NTS's header, which travels from below the bar to a title's height above the top,
-            // on the same animation: the header seems to slide over the bar
-            let edge = coverTitle > 0 && tabsHidden ? -coverTitle : tabsHeight
-            Rectangle().frame(height: 200).offset(y: edge - 200)
-        }
     }
 
     @ViewBuilder var problem: some View {
@@ -947,12 +986,36 @@ struct LiveView: View {
             }
             if store.live.isEmpty && store.error == nil { ProgressView().frame(maxHeight: .infinity) }
         }
+        // the mini player appears instantly; the cards ease into the room left for it
+        .animation(.easeOut(duration: 0.2), value: store.playingID != nil)
     }
 }
 
 struct Triangle: Shape {
     func path(in r: CGRect) -> Path {
         Path { p in p.move(to: .init(x: r.minX, y: r.minY)); p.addLine(to: .init(x: r.maxX, y: r.midY)); p.addLine(to: .init(x: r.minX, y: r.maxY)) }
+    }
+}
+
+/// The iPhone app's rerun mark: square brackets chasing each other, an arrowhead on each.
+struct ReplayIcon: View {
+    var size: CGFloat = 20
+    var body: some View {
+        // proportions measured from the iPhone app's (square overall, arrowheads a third of it)
+        Canvas { ctx, s in
+            let w = s.width, h = s.height
+            func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { .init(x: x * w, y: y * h) }
+            var lines = Path()
+            lines.addLines([pt(0.22, 0.835), pt(0.035, 0.835), pt(0.035, 0.165), pt(0.28, 0.165)])   // left bracket, out along the top
+            lines.addLines([pt(0.8, 0.165), pt(0.965, 0.165), pt(0.965, 0.835), pt(0.72, 0.835)])   // right bracket, back along the bottom
+            ctx.stroke(lines, with: .foreground, style: .init(lineWidth: w * 0.085))
+            var heads = Path()
+            heads.addLines([pt(0.27, 0), pt(0.56, 0.165), pt(0.27, 0.33)]); heads.closeSubpath()
+            heads.addLines([pt(0.73, 0.67), pt(0.41, 0.835), pt(0.73, 1)]); heads.closeSubpath()
+            ctx.fill(heads, with: .foreground)
+        }
+        .frame(width: size, height: size)   // brackets ~0.72 as tall as wide, as on iPhone
+        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }   // in a baseline row: on the baseline, dipping a hair below as on iPhone
     }
 }
 
@@ -974,9 +1037,13 @@ struct ChannelCard: View {
                     Text((d?.locationLong ?? "").nts).font(.nts(12.5, .regular))
                         .padding(.leading, 2)
                 }
-                Text(channel.now.title.nts).font(.nts(21.5))
-                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 5)
+                HStack(alignment: .firstTextBaseline) {
+                    Text(channel.now.bareTitle.nts).font(.nts(21.5))
+                        .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    if channel.now.isReplay { ReplayIcon(size: 17.5) }   // as wide as the title's cap height, as on iPhone
+                }
+                .padding(.top, 5)
                 if let end = channel.now.endTimestamp {
                     Text(hours(channel.now.startTimestamp, end).nts)
                         .font(.nts(12.5)).padding(.top, 5)
@@ -1055,7 +1122,7 @@ struct MixtapesView: View {
     @Environment(Store.self) var store
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(spacing: 1), GridItem()], spacing: 1) {
+            LazyVGrid(columns: [GridItem(spacing: 0), GridItem()], spacing: 0) {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
@@ -1066,11 +1133,13 @@ struct MixtapesView: View {
 struct MixtapeTile: View {
     @Environment(Store.self) var store
     let mixtape: Mixtape
+    @State private var hover = false
     var body: some View {
         let playing = store.playingID == mixtape.id && !store.paused
         Button { store.toggle(mixtape.id, mixtape.audioStreamEndpoint) } label: {
             Color.clear.aspectRatio(1, contentMode: .fit)
                 .overlay { Cover(url: mixtape.media?.pictureMedium.flatMap(URL.init)) }
+                .overlay { if hover, let v = store.mixtapeVideos[mixtape.id] { HoverVideo(url: v) } }
                 .overlay { Color.black.opacity(0.3) }
                 .overlay(alignment: .topLeading) {
                     Group {
@@ -1090,7 +1159,29 @@ struct MixtapeTile: View {
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .onHover { hover = $0 }
     }
+}
+
+/// A mixtape tile's hover loop: its own muted player, so it doesn't take Now Playing's shared one.
+struct HoverVideo: NSViewRepresentable {
+    let url: URL
+    final class Coordinator { let player = AVQueuePlayer(); var looper: AVPlayerLooper? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let c = context.coordinator
+        c.player.isMuted = true
+        c.looper = AVPlayerLooper(player: c.player, templateItem: AVPlayerItem(url: url))
+        c.player.play()
+        let v = NSView()
+        let layer = AVPlayerLayer(player: c.player)
+        layer.videoGravity = .resizeAspectFill
+        v.layer = layer
+        v.wantsLayer = true
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {}
+    static func dismantleNSView(_ v: NSView, coordinator: Coordinator) { coordinator.player.pause() }
 }
 
 struct SavedView: View {
@@ -1104,7 +1195,7 @@ struct SavedView: View {
     /// Signed in: the account's lists, paged in. Signed out: the local saves.
     var items: [Saved] {
         if store.email != nil { return store.feeds[tab]?.items ?? [] }
-        return tab == .history || tab == .tracks ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
+        return tab == .history ? [] : store.saved.filter { $0.isEpisode == (tab == .episodes) }
     }
 
     var body: some View {
@@ -1112,51 +1203,40 @@ struct SavedView: View {
     }
 
     @Environment(\.tabBar) var tabBar
-    @State private var titleHeight: CGFloat = 58
-    @State private var headerHeight: CGFloat = 112
-    var collapsed: Bool { !tabBar.shown }   // the title row leaves with the app's tabs
-    /// Title and tabs float over the list, as the app's tabs do, so the list never resizes.
+    @State private var headerHeight: CGFloat = 48
+    /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
-        VStack(spacing: 0) {
-            HStack {   // as on the iPhone app; the account menu replaces the old footer
-                Text("MY NTS".nts).font(.nts(32))
-                Spacer()
-                Menu {
-                    if let e = store.email {
-                        Text(e)
-                        Button("Sign Out") { store.signOut() }
-                        Divider()
-                    }
-                    Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
-                } label: {
-                    Image(systemName: "person.crop.circle.fill").font(.system(size: 24))
+        HStack(spacing: 6) {
+            // round pills, so they read as the page's filter, not a second tab bar (square boxes are the genre tags'); selected filled white
+            ForEach(SavedTab.allCases, id: \.self) { t in
+                Button { tab = t } label: {
+                    Text(t.rawValue.nts).font(.nts(11))
+                        .foregroundStyle(tab == t ? .black : .white)
+                        .padding(.horizontal, 11).padding(.vertical, 5)
+                        .background(tab == t ? .white : .clear, in: .capsule)
+                        .overlay { Capsule().strokeBorder(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
+                        .contentShape(.capsule)
                 }
-                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
-                .scaleEffect(1.8)   // ponytail: the menu button draws its label at control size, ignoring .font; scaled up to the iPhone's ~24pt
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, pageInset + 4).padding(.top, 14).padding(.bottom, 6)
-            .fixedSize(horizontal: false, vertical: true)
-            .measureHeight($titleHeight)
-            // title and icon flick out fast; the header slides up a beat slower (the app's 0.12s), carrying the tabs
-            .opacity(collapsed ? 0 : 1).animation(.easeOut(duration: 0.08), value: collapsed)
-            HStack(spacing: 0) {
-                // near-justified, as on iPhone: first flush left, last flush right, even gaps between
-                ForEach(SavedTab.allCases, id: \.self) { t in
-                    if t != SavedTab.allCases.first { Spacer(minLength: 0) }
-                    Button { tab = t } label: {
-                        Text(t.rawValue.nts).font(.nts(12.5))
-                            .frame(minHeight: 36).contentShape(.rect)
-                            .opacity(tab == t ? 1 : 0.45)
-                    }
-                    .buttonStyle(.plain)
+            Spacer(minLength: 0)
+            Menu {
+                if let e = store.email {
+                    Text(e)
+                    Button("Sign Out") { store.signOut() }
+                    Divider()
                 }
+                Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
+            } label: {
+                Image(systemName: "ellipsis.circle")   // a menu (account, Quit); a person would echo the MY NTS tab above
             }
-            .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
         }
+        .padding(.horizontal, pageInset).padding(.vertical, 10)
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($headerHeight)
         .background(.black)
-        .offset(y: tabBar.visible - (collapsed ? titleHeight : 0))
+        .offset(y: tabBar.visible)
     }
 
     var lists: some View {
@@ -1164,17 +1244,10 @@ struct SavedView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if store.email == nil { AccountView() }
                 let loading = store.feeds[tab]?.loading == true
-                let tracks = (store.feeds[.tracks]?.tracks ?? []).filter { store.savedTracks.contains($0.uid ?? "") }   // removed ones drop out
-                if (tab == .history || tab == .tracks) && store.email == nil {
-                    empty("SIGN IN FOR \(tab.rawValue.uppercased())")
-                } else if (tab == .tracks ? tracks.isEmpty : items.isEmpty) && !loading {
+                if tab == .history && store.email == nil {
+                    empty("SIGN IN FOR HISTORY")
+                } else if items.isEmpty && !loading {
                     empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
-                }
-                if tab == .tracks {
-                    ForEach(Array(tracks.enumerated()), id: \.offset) { i, t in
-                        TrackRow(track: t, state: .next)
-                            .onAppear { if i == tracks.count - 1 { Task { await store.loadMore(.tracks) } } }
-                    }
                 }
                 ForEach(items) { s in
                     SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
@@ -1186,7 +1259,6 @@ struct SavedView: View {
         }
         .modifier(HidesTabs(extra: headerHeight))
         .overlay(alignment: .top) { header }
-        .preference(key: CoversTabs.self, value: titleHeight)
         .task(id: "\(tab)\(store.email ?? "")") { await store.loadMore(tab) }
     }
 
@@ -1246,7 +1318,7 @@ struct EpisodeRow: View {
                     // as many tags as fit beside the artwork, clear of the ⋯, sitting on its bottom edge
                     ViewThatFits(in: .vertical) {
                         ForEach((0...tags.count).reversed(), id: \.self) { n in
-                            Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: tag) }.padding(.top, 4).padding(.trailing, 26)
+                            Flow(spacing: 5) { ForEach(tags.prefix(n), id: \.self, content: genreTag) }.padding(.top, 4).padding(.trailing, 26)
                         }
                     }
                     .frame(maxHeight: .infinity, alignment: .bottomLeading)   // last row level with the artwork's bottom
@@ -1284,12 +1356,13 @@ struct EpisodeRow: View {
         }
         if let l = latest { await store.playEpisode(l) }
     }
+}
 
-    func tag(_ t: String) -> some View {
-        Text(t.nts).font(.nts(9.5)).lineLimit(1).fixedSize()
-            .padding(.horizontal, 5).padding(.vertical, 3)
-            .overlay { Rectangle().stroke(.white.opacity(0.35), lineWidth: 1) }
-    }
+/// A boxed genre tag, as on nts.live.
+func genreTag(_ t: String) -> some View {
+    Text(t.nts).font(.nts(9.5)).lineLimit(1).fixedSize()
+        .padding(.horizontal, 5).padding(.vertical, 3)
+        .overlay { Rectangle().stroke(.white.opacity(0.35), lineWidth: 1) }
 }
 
 /// Lays subviews out left to right, wrapping onto new lines.
@@ -1467,11 +1540,30 @@ let miniHeight: CGFloat = 53   // iPhone mini player (59pt) ×0.896
 /// What's playing, under the page, as on the iPhone app: artwork, pause/play, title and times; tap to open Now Playing.
 struct MiniPlayer: View {
     @Environment(Store.self) var store
+    var expanded = false   // on Now Playing: the chevron points down, a tap goes back
     let open: () -> Void
 
+    /// The playing episode's tracklist path and how far in we are (live shows and archive episodes; mixtapes have none).
+    func episode(at now: Date) -> (path: String, elapsed: Double)? {
+        let id = store.playingID
+        if let c = store.live.first(where: { $0.id == id }), let p = c.now.embeds?.details?.episodePath {
+            return (p, now.timeIntervalSince(c.now.startTimestamp))
+        }
+        if let e = store.episode, e.id == id { return (String(e.id.dropFirst()), store.position) }
+        return nil
+    }
+
+    /// The track playing now, from a timestamped tracklist, in place of the subtitle.
+    func track(at now: Date) -> String? {
+        guard let (path, elapsed) = episode(at: now),
+              let t = store.tracklists[path]?.last(where: { Double($0.offset ?? .max) <= elapsed }) else { return nil }
+        return [t.artist, t.title].compactMap { $0 }.joined(separator: " - ")
+    }
+
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
-            let (image, title, subtitle) = info
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let (image, title, info) = info
+            let track = track(at: ctx.date)
             HStack(spacing: 0) {
                 Cover(url: image).frame(width: miniHeight, height: miniHeight)
                 Button { store.pauseResume() } label: {
@@ -1483,13 +1575,26 @@ struct MiniPlayer: View {
                 .buttonStyle(.plain)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(title.nts).font(.nts(14)).lineLimit(1)
-                    Text(subtitle.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                    if let err = store.streamError {
+                        Text(err).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).help(err)
+                    } else if let track {
+                        Button {   // straight to the tracklist
+                            store.showTracklist = true
+                            if !expanded { open() }
+                        } label: {
+                            Text(track.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        Text(info.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 8)
-                Image(systemName: "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
+                Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
             }
             .contentShape(.rect)
             .onTapGesture(perform: open)
+            .task(id: episode(at: ctx.date)?.path) { if let p = episode(at: .now)?.path { await store.loadTracklist(p) } }
         }
         .frame(height: miniHeight)
         .overlay(alignment: .top) { ProgressLine() }
@@ -1563,20 +1668,29 @@ struct SectionLabel: View {
 
 /// Description and the current/next track (live and archive episode pages).
 struct EpisodeInfo: View {
-    let details: Details?, tracks: [Track]?, current: Int?, openTracklist: () -> Void
+    let details: Details?, tracks: [Track]?, openTracklist: () -> Void
     var body: some View {
         // Description size measured from the NTS iPhone episode page (×0.896 for 360pt)
         if let desc = details?.description, !desc.isEmpty {
             Text(desc).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, pageInset).padding(.top, 13)
         }
+        if let tags = details?.genres?.map(\.value), !tags.isEmpty {
+            Flow(spacing: 5) { ForEach(tags, id: \.self, content: genreTag) }
+                .padding(.horizontal, pageInset).padding(.top, 13)
+        }
         if let tracks, !tracks.isEmpty {
             Rule().padding(.horizontal, pageInset).padding(.top, 18)
-            // always one row (the first track before it starts):
-            // the menu bar window doesn't grow while open, so the section mustn't change height
-            TrackRow(track: tracks[current ?? 0], state: .next, episode: details?.episodePath, note: true)   // .next: no highlight, the ♫ says it's playing
-                .padding(.top, 4)   // even with the 18pt above the rule
-                .contentShape(.rect).onTapGesture(perform: openTracklist)
+            // a link, not the playing track: the mini player below already shows what's on
+            Button(action: openTracklist) {
+                HStack {
+                    Text("TRACKLIST".nts).font(.nts(13))
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
+                }
+                .padding(.horizontal, pageInset).padding(.top, 18).contentShape(.rect)   // the next section's rule brings its own 18 below
+            }
+            .buttonStyle(.plain)
         }
     }
 }
@@ -1602,7 +1716,6 @@ struct PlayOverlay: View {
             .buttonStyle(.plain)
         }
         .frame(height: 221)
-        .overlay(alignment: .bottom) { ProgressLine() }
     }
 
     func control(_ symbol: String, action: @escaping () -> Void) -> some View {
@@ -1614,7 +1727,6 @@ struct PlayOverlay: View {
 struct EpisodeNowView: View {
     @Environment(Store.self) var store
     let id: String, d: Details
-    @State private var showTracklist = false
 
     var path: String { String(id.dropFirst()) }
 
@@ -1623,8 +1735,8 @@ struct EpisodeNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             let pos = store.position, dur = store.duration
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
-            if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { showTracklist = false }
+            if store.showTracklist, let tracks {
+                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { store.showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1643,7 +1755,7 @@ struct EpisodeNowView: View {
                             Text("-" + clock(dur - at)).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
                         Spacer(minLength: 12)
                     }
                 }
@@ -1656,7 +1768,6 @@ struct EpisodeNowView: View {
 struct ChannelNowView: View {
     @Environment(Store.self) var store
     let channel: Channel
-    @State private var showTracklist = false
 
     var body: some View {
         let b = channel.now, d = b.embeds?.details
@@ -1664,16 +1775,19 @@ struct ChannelNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let elapsed = ctx.date.timeIntervalSince(b.startTimestamp)
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= elapsed }
-            if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { showTracklist = false }
+            if store.showTracklist, let tracks {
+                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { store.showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let end = b.endTimestamp ?? ctx.date
-                        NowHeader(image: d?.media?.wide, title: b.title) {
+                        NowHeader(image: d?.media?.wide, title: b.bareTitle) {
                             ChannelBadge(channel: channel.channelName, location: d?.locationLong ?? "")
                         } accessory: {
-                            SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
+                            HStack(spacing: 14) {
+                                if b.isReplay { ReplayIcon(size: 13).padding(.top, 3) }   // as wide as the 16pt title's cap height, level with it
+                                SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
+                            }
                         }
                         .overlay(alignment: .top) { PlayOverlay() }
                         HStack {
@@ -1682,7 +1796,7 @@ struct ChannelNowView: View {
                             Text("\(Int(end.timeIntervalSince(ctx.date) / 60)) MIN LEFT".nts).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
 
                         if let next = channel.next {
                             Rule().padding(.horizontal, pageInset).padding(.top, 18)
@@ -1741,7 +1855,7 @@ struct FitScroll<Content: View>: View {
             content.measureHeight($height)
         }
         .scrollBounceBehavior(.basedOnSize)
-        .frame(height: min(height, contentHeight))
+        .frame(height: min(height, contentHeight - miniHeight))   // only on Now Playing, which keeps the mini player
     }
 }
 
@@ -1780,7 +1894,7 @@ struct TracklistView: View {
                 .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { listHeight = $1 }
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
-            .frame(height: min(listHeight, contentHeight - 45))   // short lists: the window shrinks to fit, as FitScroll does
+            .frame(height: min(listHeight, contentHeight - 45 - miniHeight))   // short lists: the window shrinks to fit, as FitScroll does
         }
     }
 }
@@ -1814,10 +1928,8 @@ struct TrackRow: View {
     enum State { case past, now, next }
     let track: Track, state: State
     var episode: String?   // shows/x/episodes/y, for saving the track
-    var note = false   // ♫ before the track (Now Playing); no SF Symbol has beamed eighth notes
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            if note { Text("♫").font(.system(size: 20)).frame(height: 30) }
             VStack(alignment: .leading, spacing: 1) {
                 Text((track.artist ?? "").nts).font(.nts(12)).lineLimit(1)
                 Text(track.title ?? "").font(.system(size: 12)).opacity(0.75).lineLimit(1)
