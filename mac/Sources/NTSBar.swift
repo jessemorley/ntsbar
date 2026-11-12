@@ -938,7 +938,7 @@ struct RootView: View {
                 .buttonStyle(.plain)
             }
         }
-        .overlay(alignment: .bottom) { Divider() }
+        .overlay(alignment: .bottom) { if page != .saved { Divider() } }   // My NTS's own tab row follows straight on
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
@@ -1141,15 +1141,15 @@ struct SavedView: View {
     /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
         HStack(spacing: 6) {
-            // boxed like the genre tags, so they read as the page's filter, not a second tab bar; selected filled white
+            // round pills, so they read as the page's filter, not a second tab bar (square boxes are the genre tags'); selected filled white
             ForEach(SavedTab.allCases, id: \.self) { t in
                 Button { tab = t } label: {
                     Text(t.rawValue.nts).font(.nts(11))
                         .foregroundStyle(tab == t ? .black : .white)
-                        .padding(.horizontal, 8).padding(.vertical, 5)
-                        .background(tab == t ? .white : .clear)
-                        .overlay { Rectangle().stroke(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
-                        .contentShape(.rect)
+                        .padding(.horizontal, 11).padding(.vertical, 5)
+                        .background(tab == t ? .white : .clear, in: .capsule)
+                        .overlay { Capsule().strokeBorder(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
+                        .contentShape(.capsule)
                 }
                 .buttonStyle(.plain)
             }
