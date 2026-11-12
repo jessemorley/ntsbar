@@ -198,6 +198,7 @@ enum Keychain {
 @Observable @MainActor final class Store {
     var live: [Channel] = []
     var mixtapes: [Mixtape] = []
+    var mixtapeVideos: [String: URL] = [:]   // cached hover loops, by mixtape id
     var playingID: String?
     var mixtapeNow: (title: String, path: String?)?   // the episode the playing mixtape is on
     var error: String?
@@ -236,7 +237,19 @@ enum Keychain {
                 try? await Task.sleep(for: .seconds(min(60, ends.min() ?? 60)))
             }
         }
-        Task { mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow() }
+        Task {
+            mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow()
+            // the tiles' 120px hover loops (~4 MB in all), kept on disk so hover plays at once
+            let dir = URL.cachesDirectory.appending(path: "NTSBar/mixtape-videos")   // NTSBar/ itself is URLSession's cache
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            for m in mixtapes {
+                guard let remote = m.media?.animationThumb.flatMap(URL.init) else { continue }
+                let file = dir.appending(path: remote.lastPathComponent)   // names carry a content hash
+                if !FileManager.default.fileExists(atPath: file.path),
+                   let (tmp, _) = try? await URLSession.shared.download(from: remote) { try? FileManager.default.moveItem(at: tmp, to: file) }
+                if FileManager.default.fileExists(atPath: file.path) { mixtapeVideos[m.id] = file }
+            }
+        }
         Task {
             // ponytail: polls every 30s; nts.live uses a Firestore onSnapshot listener, switch if the lag shows
             while true { await refreshMixtapeNow(); try? await Task.sleep(for: .seconds(30)) }
@@ -1120,11 +1133,13 @@ struct MixtapesView: View {
 struct MixtapeTile: View {
     @Environment(Store.self) var store
     let mixtape: Mixtape
+    @State private var hover = false
     var body: some View {
         let playing = store.playingID == mixtape.id && !store.paused
         Button { store.toggle(mixtape.id, mixtape.audioStreamEndpoint) } label: {
             Color.clear.aspectRatio(1, contentMode: .fit)
                 .overlay { Cover(url: mixtape.media?.pictureMedium.flatMap(URL.init)) }
+                .overlay { if hover, let v = store.mixtapeVideos[mixtape.id] { HoverVideo(url: v) } }
                 .overlay { Color.black.opacity(0.3) }
                 .overlay(alignment: .topLeading) {
                     Group {
@@ -1144,7 +1159,29 @@ struct MixtapeTile: View {
                 .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .onHover { hover = $0 }
     }
+}
+
+/// A mixtape tile's hover loop: its own muted player, so it doesn't take Now Playing's shared one.
+struct HoverVideo: NSViewRepresentable {
+    let url: URL
+    final class Coordinator { let player = AVQueuePlayer(); var looper: AVPlayerLooper? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> NSView {
+        let c = context.coordinator
+        c.player.isMuted = true
+        c.looper = AVPlayerLooper(player: c.player, templateItem: AVPlayerItem(url: url))
+        c.player.play()
+        let v = NSView()
+        let layer = AVPlayerLayer(player: c.player)
+        layer.videoGravity = .resizeAspectFill
+        v.layer = layer
+        v.wantsLayer = true
+        return v
+    }
+    func updateNSView(_ v: NSView, context: Context) {}
+    static func dismantleNSView(_ v: NSView, coordinator: Coordinator) { coordinator.player.pause() }
 }
 
 struct SavedView: View {
