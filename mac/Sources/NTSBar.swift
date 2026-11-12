@@ -941,7 +941,7 @@ struct RootView: View {
                 .buttonStyle(.plain)
             }
         }
-        .overlay(alignment: .bottom) { if page != .saved { Divider() } }   // My NTS's own tab row follows straight on
+        .overlay(alignment: .bottom) { if page != .saved { Rectangle().fill(.white.opacity(0.45)).frame(height: 1) } }   // My NTS's own tab row follows straight on
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($tabsHeight)
         .opacity(tabsHidden ? 0 : 1)
@@ -1109,7 +1109,7 @@ struct MixtapesView: View {
     @Environment(Store.self) var store
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(spacing: 1), GridItem()], spacing: 1) {
+            LazyVGrid(columns: [GridItem(spacing: 0), GridItem()], spacing: 0) {
                 ForEach(store.mixtapes) { m in MixtapeTile(mixtape: m) }
             }
         }
