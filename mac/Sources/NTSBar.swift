@@ -30,6 +30,9 @@ struct Broadcast: Decodable {
     var broadcastTitle: String, startTimestamp: Date, endTimestamp: Date?
     // API titles carry HTML entities (e.g. &amp;)
     var title: String { broadcastTitle.htmlDecoded }
+    /// Reruns end " (R)"; the big titles drop it for the ReplayIcon, as on iPhone (small text keeps it).
+    var isReplay: Bool { title.hasSuffix(" (R)") }
+    var bareTitle: String { isReplay ? String(title.dropLast(4)) : title }
     var embeds: Embeds?
     struct Embeds: Decodable { var details: Details? }
 }
@@ -981,6 +984,28 @@ struct Triangle: Shape {
     }
 }
 
+/// The iPhone app's rerun mark: square brackets chasing each other, an arrowhead on each.
+struct ReplayIcon: View {
+    var size: CGFloat = 20
+    var body: some View {
+        // proportions measured from the iPhone app's (square overall, arrowheads a third of it)
+        Canvas { ctx, s in
+            let w = s.width, h = s.height
+            func pt(_ x: CGFloat, _ y: CGFloat) -> CGPoint { .init(x: x * w, y: y * h) }
+            var lines = Path()
+            lines.addLines([pt(0.22, 0.835), pt(0.035, 0.835), pt(0.035, 0.165), pt(0.28, 0.165)])   // left bracket, out along the top
+            lines.addLines([pt(0.8, 0.165), pt(0.965, 0.165), pt(0.965, 0.835), pt(0.72, 0.835)])   // right bracket, back along the bottom
+            ctx.stroke(lines, with: .foreground, style: .init(lineWidth: w * 0.085))
+            var heads = Path()
+            heads.addLines([pt(0.27, 0), pt(0.56, 0.165), pt(0.27, 0.33)]); heads.closeSubpath()
+            heads.addLines([pt(0.73, 0.67), pt(0.41, 0.835), pt(0.73, 1)]); heads.closeSubpath()
+            ctx.fill(heads, with: .foreground)
+        }
+        .frame(width: size, height: size)   // brackets ~0.72 as tall as wide, as on iPhone
+        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - 1 }   // in a baseline row: on the baseline, dipping a hair below as on iPhone
+    }
+}
+
 struct ChannelCard: View {
     @Environment(Store.self) var store
     let channel: Channel
@@ -999,9 +1024,13 @@ struct ChannelCard: View {
                     Text((d?.locationLong ?? "").nts).font(.nts(12.5, .regular))
                         .padding(.leading, 2)
                 }
-                Text(channel.now.title.nts).font(.nts(21.5))
-                    .lineLimit(3).fixedSize(horizontal: false, vertical: true)
-                    .padding(.top, 5)
+                HStack(alignment: .firstTextBaseline) {
+                    Text(channel.now.bareTitle.nts).font(.nts(21.5))
+                        .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    if channel.now.isReplay { ReplayIcon(size: 17.5) }   // as wide as the title's cap height, as on iPhone
+                }
+                .padding(.top, 5)
                 if let end = channel.now.endTimestamp {
                     Text(hours(channel.now.startTimestamp, end).nts)
                         .font(.nts(12.5)).padding(.top, 5)
@@ -1715,10 +1744,13 @@ struct ChannelNowView: View {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let end = b.endTimestamp ?? ctx.date
-                        NowHeader(image: d?.media?.wide, title: b.title) {
+                        NowHeader(image: d?.media?.wide, title: b.bareTitle) {
                             ChannelBadge(channel: channel.channelName, location: d?.locationLong ?? "")
                         } accessory: {
-                            SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
+                            HStack(spacing: 14) {
+                                if b.isReplay { ReplayIcon(size: 13).padding(.top, 3) }   // as wide as the 16pt title's cap height, level with it
+                                SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp, size: 15)
+                            }
                         }
                         .overlay(alignment: .top) { PlayOverlay() }
                         HStack {
