@@ -219,6 +219,7 @@ enum Keychain {
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
     var problem: String?
     var streamError: String?   // shown in the mini player while the failed item sits paused
+    var showTracklist = false   // Now Playing shows the tracklist in place of the episode page (the mini player's track opens it)
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
@@ -917,6 +918,7 @@ struct RootView: View {
                 }
             }
         }
+        .onChange(of: page) { if page != .nowPlaying { store.showTracklist = false } }   // Now Playing reopens on the episode
     }
 
     var tabs: some View {
@@ -1161,7 +1163,7 @@ struct SavedView: View {
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
         }
-        .padding(.horizontal, pageInset + 4).padding(.vertical, 6)
+        .padding(.horizontal, pageInset + 4)
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($headerHeight)
         .background(.black)
@@ -1471,7 +1473,6 @@ struct MiniPlayer: View {
     @Environment(Store.self) var store
     var expanded = false   // on Now Playing: the chevron points down, a tap goes back
     let open: () -> Void
-    @State private var hover = false
 
     /// The playing episode's tracklist path and how far in we are (live shows and archive episodes; mixtapes have none).
     func episode(at now: Date) -> (path: String, elapsed: Double)? {
@@ -1483,9 +1484,9 @@ struct MiniPlayer: View {
         return nil
     }
 
-    /// Hovered: the track playing now, from the tracklist, in place of the subtitle.
+    /// The track playing now, from a timestamped tracklist, in place of the subtitle.
     func track(at now: Date) -> String? {
-        guard hover, let (path, elapsed) = episode(at: now),
+        guard let (path, elapsed) = episode(at: now),
               let t = store.tracklists[path]?.last(where: { Double($0.offset ?? .max) <= elapsed }) else { return nil }
         return [t.artist, t.title].compactMap { $0 }.joined(separator: " - ")
     }
@@ -1493,7 +1494,7 @@ struct MiniPlayer: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let (image, title, info) = info
-            let subtitle = track(at: ctx.date) ?? info
+            let track = track(at: ctx.date)
             HStack(spacing: 0) {
                 Cover(url: image).frame(width: miniHeight, height: miniHeight)
                 Button { store.pauseResume() } label: {
@@ -1507,8 +1508,16 @@ struct MiniPlayer: View {
                     Text(title.nts).font(.nts(14)).lineLimit(1)
                     if let err = store.streamError {
                         Text(err).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).help(err)
+                    } else if let track {
+                        Button {   // straight to the tracklist
+                            store.showTracklist = true
+                            if !expanded { open() }
+                        } label: {
+                            Text(track.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
                     } else {
-                        Text(subtitle.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
+                        Text(info.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
                     }
                 }
                 Spacer(minLength: 8)
@@ -1516,7 +1525,6 @@ struct MiniPlayer: View {
             }
             .contentShape(.rect)
             .onTapGesture(perform: open)
-            .onHover { hover = $0 }
             .task(id: episode(at: ctx.date)?.path) { if let p = episode(at: .now)?.path { await store.loadTracklist(p) } }
         }
         .frame(height: miniHeight)
@@ -1591,7 +1599,7 @@ struct SectionLabel: View {
 
 /// Description and the current/next track (live and archive episode pages).
 struct EpisodeInfo: View {
-    let details: Details?, tracks: [Track]?, current: Int?, openTracklist: () -> Void
+    let details: Details?, tracks: [Track]?, openTracklist: () -> Void
     var body: some View {
         // Description size measured from the NTS iPhone episode page (×0.896 for 360pt)
         if let desc = details?.description, !desc.isEmpty {
@@ -1604,11 +1612,16 @@ struct EpisodeInfo: View {
         }
         if let tracks, !tracks.isEmpty {
             Rule().padding(.horizontal, pageInset).padding(.top, 18)
-            // always one row (the first track before it starts):
-            // the menu bar window doesn't grow while open, so the section mustn't change height
-            TrackRow(track: tracks[current ?? 0], state: .next, episode: details?.episodePath, note: true)   // .next: no highlight, the ♫ says it's playing
-                .padding(.top, 4)   // even with the 18pt above the rule
-                .contentShape(.rect).onTapGesture(perform: openTracklist)
+            // a link, not the playing track: the mini player below already shows what's on
+            Button(action: openTracklist) {
+                HStack {
+                    Text("TRACKLIST".nts).font(.nts(13))
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold))
+                }
+                .padding(.horizontal, pageInset).padding(.top, 18).contentShape(.rect)   // the next section's rule brings its own 18 below
+            }
+            .buttonStyle(.plain)
         }
     }
 }
@@ -1645,7 +1658,6 @@ struct PlayOverlay: View {
 struct EpisodeNowView: View {
     @Environment(Store.self) var store
     let id: String, d: Details
-    @State private var showTracklist = false
 
     var path: String { String(id.dropFirst()) }
 
@@ -1654,8 +1666,8 @@ struct EpisodeNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             let pos = store.position, dur = store.duration
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
-            if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { showTracklist = false }
+            if store.showTracklist, let tracks {
+                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { store.showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1674,7 +1686,7 @@ struct EpisodeNowView: View {
                             Text("-" + clock(dur - at)).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
                         Spacer(minLength: 12)
                     }
                 }
@@ -1687,7 +1699,6 @@ struct EpisodeNowView: View {
 struct ChannelNowView: View {
     @Environment(Store.self) var store
     let channel: Channel
-    @State private var showTracklist = false
 
     var body: some View {
         let b = channel.now, d = b.embeds?.details
@@ -1695,8 +1706,8 @@ struct ChannelNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let elapsed = ctx.date.timeIntervalSince(b.startTimestamp)
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= elapsed }
-            if showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { showTracklist = false }
+            if store.showTracklist, let tracks {
+                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { store.showTracklist = false }
             } else {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
@@ -1713,7 +1724,7 @@ struct ChannelNowView: View {
                             Text("\(Int(end.timeIntervalSince(ctx.date) / 60)) MIN LEFT".nts).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks, current: current) { showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
 
                         if let next = channel.next {
                             Rule().padding(.horizontal, pageInset).padding(.top, 18)
@@ -1845,10 +1856,8 @@ struct TrackRow: View {
     enum State { case past, now, next }
     let track: Track, state: State
     var episode: String?   // shows/x/episodes/y, for saving the track
-    var note = false   // ♫ before the track (Now Playing); no SF Symbol has beamed eighth notes
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            if note { Text("♫").font(.system(size: 20)).frame(height: 30) }
             VStack(alignment: .leading, spacing: 1) {
                 Text((track.artist ?? "").nts).font(.nts(12)).lineLimit(1)
                 Text(track.title ?? "").font(.system(size: 12)).opacity(0.75).lineLimit(1)
