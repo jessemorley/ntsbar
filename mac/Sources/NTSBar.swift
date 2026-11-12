@@ -1140,17 +1140,20 @@ struct SavedView: View {
     @State private var headerHeight: CGFloat = 48
     /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
-        HStack(spacing: 0) {
-            // near-justified, as on iPhone: first flush left, the account menu flush right, even gaps between
+        HStack(spacing: 6) {
+            // boxed like the genre tags, so they read as the page's filter, not a second tab bar; selected filled white
             ForEach(SavedTab.allCases, id: \.self) { t in
                 Button { tab = t } label: {
-                    Text(t.rawValue.nts).font(.nts(12.5))
-                        .frame(minHeight: 36).contentShape(.rect)
-                        .opacity(tab == t ? 1 : 0.45)
+                    Text(t.rawValue.nts).font(.nts(11))
+                        .foregroundStyle(tab == t ? .black : .white)
+                        .padding(.horizontal, 8).padding(.vertical, 5)
+                        .background(tab == t ? .white : .clear)
+                        .overlay { Rectangle().stroke(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
+                        .contentShape(.rect)
                 }
                 .buttonStyle(.plain)
-                Spacer(minLength: 0)
             }
+            Spacer(minLength: 0)
             Menu {
                 if let e = store.email {
                     Text(e)
@@ -1159,11 +1162,11 @@ struct SavedView: View {
                 }
                 Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
             } label: {
-                Image(systemName: "person.crop.circle.fill")
+                Image(systemName: "ellipsis.circle")   // a menu (account, Quit); a person would echo the MY NTS tab above
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
         }
-        .padding(.horizontal, pageInset + 4)
+        .padding(.horizontal, pageInset).padding(.vertical, 10)
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($headerHeight)
         .background(.black)
