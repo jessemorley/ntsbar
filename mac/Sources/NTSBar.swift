@@ -523,6 +523,10 @@ enum Keychain {
     }
 
     @ObservationIgnored private var streamURL: URL?
+    /// When the episode's HLS was resolved. SoundCloud signs the playlist for about an hour and its pieces for about three,
+    /// so a later load (resume, output switch, retry) asks for a fresh one first.
+    @ObservationIgnored private var resolvedAt = Date.distantPast
+    private var stale: Bool { -resolvedAt.timeIntervalSinceNow > 45 * 60 }
 
     var rooms: [SonosRoom] = []   // found at launch and again whenever the mini player shows
     var speaker: SonosRoom? { didSet { UserDefaults.standard.set(speaker?.name, forKey: "speaker") } }   // chosen output for live and mixtapes; nil plays on this Mac
@@ -541,6 +545,19 @@ enum Keychain {
     /// Starts the playing item's stream (an archive episode from `start` seconds): on the chosen Sonos room, else on the Mac.
     /// Live and mixtapes the speaker fetches itself; an episode goes through an EpisodeRelay.
     private func load(_ u: URL, at start: Double = 0) {
+        if episode?.id == playingID, stale, let source = episode?.details.source {
+            let id = playingID
+            player.pause(); resolving = true
+            Task {
+                defer { resolving = false }
+                let fresh = try? await resolveStream(source)
+                guard playingID == id, !paused else { return }
+                guard let fresh else { listenStop(); paused = true; streamError = "Can't reach NTS"; return nowPlaying() }
+                streamURL = fresh; resolvedAt = .now
+                load(fresh, at: start)
+            }
+            return
+        }
         if let c = cast, c != speaker { stopCast(c) }
         dropRelay()   // the same room just takes the new URI, no Stop that could land after it
         guard let s = speaker else { playHere(u, at: start); return }
@@ -581,7 +598,9 @@ enum Keychain {
 
     private func castFailed(_ s: SonosRoom, _ id: String?) {
         guard cast == s, playingID == id else { return }
-        listenStop(); dropRelay()
+        listenStop()
+        if castClock != nil { castClock = (position, .now) }   // kept, paused: play carries on from here
+        relay?.stop(); relay = nil
         cast = nil; paused = true; pendingID = nil; streamError = "Can't reach \(s.name)"; nowPlaying()
     }
 
@@ -678,6 +697,7 @@ enum Keychain {
             return
         }
         listenStop(); player.pause(); paused = true; pendingID = nil
+        if episode?.id == id { resolvedAt = .distantPast }   // likely expired: play resolves it afresh
         streamError = "Can't play stream" + (why.map { ". \($0)" } ?? "")
         nowPlaying()
     }
@@ -701,10 +721,10 @@ enum Keychain {
             listenStop()
             if relay != nil, let c = cast { castCommandAt = .now; castClock = (position, .now); paused = true; Task { try? await c.pause() }; return }
             player.pause(); stopCast()
-        } else if archive, streamError == nil, relay != nil ? cast == speaker : speaker == nil && player.currentItem != nil {
+        } else if archive, streamError == nil, relay != nil ? cast == speaker : speaker == nil && player.currentItem != nil && -resolvedAt.timeIntervalSinceNow < 150 * 60 {   // the player's pieces expire too
             if relay != nil, let c = cast { castCommandAt = .now; castClock = (position, .now); Task { try? await c.resume() } } else { player.play() }
             paused = false; listenStart(); return
-        } else if let u = streamURL { load(u, at: archive && streamError == nil ? position : 0) }   // ponytail: a failed episode retries from the start, seek back if that annoys
+        } else if let u = streamURL { load(u, at: archive ? position : 0) }   // a failed episode carries on where it stopped
         paused.toggle()
         streamError = nil
         if archive, !paused { listenStart() }
@@ -719,6 +739,7 @@ enum Keychain {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.source else { throw APIError(errorDescription: "No audio for this episode") }
             let hls = try await resolveStream(source)
+            resolvedAt = .now
             episode = (id, d)
             toggle(id, hls.absoluteString)
             listenStart()
