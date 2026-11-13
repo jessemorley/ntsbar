@@ -252,7 +252,9 @@ enum Keychain {
             }
         }
         Task {
-            mixtapes = (try? await fetch("mixtapes")) ?? []; await refreshMixtapeNow()
+            mixtapes = (try? await fetch("mixtapes")) ?? []
+            cacheImages(mixtapeImages)   // tiles + icons drawn at once
+            await refreshMixtapeNow()
             // the tiles' 120px hover loops (~4 MB in all), kept on disk so hover plays at once
             let dir = URL.cachesDirectory.appending(path: "NTSBar/mixtape-videos")   // NTSBar/ itself is URLSession's cache
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -572,8 +574,11 @@ enum Keychain {
         }
     }
 
+    var mixtapeImages: [URL] { mixtapes.flatMap { [$0.media?.pictureMedium, $0.media?.iconWhite].compactMap { $0.flatMap(URL.init) } } }
+
     private func cacheImages(_ urls: [URL?]) {
-        if images.count > 60 { images.removeAll() }   // ponytail: crude cap on decoded bitmaps; an LRU if hover-browsing many shows matters
+        // ponytail: crude cap on decoded bitmaps (hover prefetches; mixtape tiles stay); an LRU if hover-browsing many shows matters
+        if images.count > 100 { let keep = Set(mixtapeImages); images = images.filter { keep.contains($0.key) } }
         for case let u? in urls where images[u] == nil {
             Task { if let (d, _) = try? await URLSession.shared.data(from: u), let img = NSImage(data: d) { images[u] = img } }
         }
@@ -856,6 +861,16 @@ struct Cover: View {
                 .allowsHitTesting(false)
             }
             .clipped()
+    }
+}
+
+/// A small image fitted whole (mixtape icons); prefetched ones draw at once.
+struct Icon: View {
+    @Environment(Store.self) var store
+    let url: URL?
+    var body: some View {
+        if let img = url.flatMap({ store.images[$0] }) { Image(nsImage: img).resizable().interpolation(.high).scaledToFit() }
+        else { AsyncImage(url: url) { $0.resizable().interpolation(.high).scaledToFit() } placeholder: { Color.clear } }
     }
 }
 
@@ -1455,8 +1470,7 @@ struct MixtapeTile: View {
                 }
                 .overlay(alignment: .bottomLeading) {
                     HStack(spacing: 6) {
-                        AsyncImage(url: mixtape.media?.iconWhite.flatMap(URL.init)) { $0.resizable().scaledToFit() } placeholder: { Color.clear }
-                            .frame(width: 13, height: 13)
+                        Icon(url: mixtape.media?.iconWhite.flatMap(URL.init)).frame(width: 13, height: 13)
                         Text(mixtape.title.nts).font(.nts(15)).lineLimit(1)
                     }
                     .padding(10)
@@ -2281,7 +2295,7 @@ struct MixtapeNowView: View {
         FitScroll {
             VStack(alignment: .leading, spacing: 0) {
                 NowHeader(image: mixtape.media?.wide, title: mixtape.title, video: mixtape.media?.animationThumb.flatMap(URL.init), titleSize: 22) {
-                    AsyncImage(url: mixtape.media?.iconWhite.flatMap(URL.init)) { $0.resizable().interpolation(.high).antialiased(true).scaledToFit() } placeholder: { Color.clear }
+                    Icon(url: mixtape.media?.iconWhite.flatMap(URL.init))
                         .frame(width: 26, height: 26)
                 } accessory: { EmptyView() }
                 .overlay(alignment: .top) { PlayOverlay() }
