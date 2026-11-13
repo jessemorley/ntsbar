@@ -2459,12 +2459,20 @@ struct SpeakerButton: View {
 }
 
 /// The system AirPlay menu for the Mac's player, laid invisibly over a row so the whole row opens it (its button fills its frame).
-/// AirPlay carries the Mac's player, so opening it switches off Sonos.
+/// AirPlay carries the Mac's player, so picking a device switches off Sonos; just opening the menu changes nothing.
 struct AirPlayPicker: NSViewRepresentable {
-    let player: AVPlayer, opening: () -> Void
-    final class Coordinator: NSObject, AVRoutePickerViewDelegate {
-        var opening: () -> Void = {}
-        func routePickerViewWillBeginPresentingRoutes(_ v: AVRoutePickerView) { opening() }
+    let player: AVPlayer, picked: () -> Void
+    @MainActor final class Coordinator: NSObject, @preconcurrency AVRoutePickerViewDelegate {   // AppKit calls it on the main thread
+        var picked: () -> Void = {}
+        func routePickerViewDidEndPresentingRoutes(_ v: AVRoutePickerView) {
+            // No public way to read the chosen route: isExternalPlaybackActive, or the picker's own flag (private, so asked for warily)
+            Task {
+                try? await Task.sleep(for: .milliseconds(300))   // the route lands just after the menu closes
+                let flag = Selector(("_isAirPlayActive"))
+                let active = v.player?.isExternalPlaybackActive == true || (v.responds(to: flag) && (v.value(forKey: "_isAirPlayActive") as? Bool) == true)
+                if active { picked() }
+            }
+        }
     }
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> AVRoutePickerView {
@@ -2473,7 +2481,7 @@ struct AirPlayPicker: NSViewRepresentable {
         v.delegate = context.coordinator
         return v
     }
-    func updateNSView(_ v: AVRoutePickerView, context: Context) { v.player = player; context.coordinator.opening = opening }
+    func updateNSView(_ v: AVRoutePickerView, context: Context) { v.player = player; context.coordinator.picked = picked }
 }
 
 /// Artwork with the show info below it, as on the NTS iPhone show page (sizes measured from it, ×0.896).
