@@ -2127,7 +2127,6 @@ struct TracklistView: View {
     var seek: ((Double) -> Void)?   // archive episodes: tap a track to jump to it
     let back: () -> Void
     @State private var listHeight = contentHeight
-    @State private var scrolled = false
     var body: some View {
         VStack(spacing: 0) {
             Button(action: back) {
@@ -2139,7 +2138,6 @@ struct TracklistView: View {
                 .contentShape(.rect)
             }
             .buttonStyle(.plain)
-            Rule().opacity(scrolled ? 1 : 0)   // only once rows pass under the header
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 0) {
@@ -2153,7 +2151,6 @@ struct TracklistView: View {
                     .padding(.vertical, 6)
                 }
                 .scrollBounceBehavior(.basedOnSize)
-                .onScrollGeometryChange(for: Bool.self) { $0.scrolled > 0.5 } action: { scrolled = $1 }
                 .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { listHeight = $1 }
                 .onAppear { if let current { proxy.scrollTo(current, anchor: .center) } }
             }
