@@ -579,7 +579,7 @@ enum Keychain {
         Task {
             do { try await r.start(for: s.host, path: id ?? "/episode") } catch {
                 guard relay === r else { return r.stop() }
-                dropRelay(); cast = nil   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it
+                stopCast(s)   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it, and the room stops what it had on
                 return playHere(u, at: start)
             }
             guard relay === r, let url = r.url else { return r.stop() }
