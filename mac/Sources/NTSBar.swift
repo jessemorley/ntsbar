@@ -11,9 +11,11 @@ let liveStreams = ["1": "https://stream-relay-geo.ntslive.net/stream",
                    "2": "https://stream-relay-geo.ntslive.net/stream2"]
 
 struct Media: Decodable {
-    var backgroundMediumLarge: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?, animationThumb: String?
+    var backgroundMediumLarge: String?, backgroundMedium: String?, pictureMedium: String?, pictureLarge: String?, pictureSmall: String?, iconWhite: String?, animationThumb: String?
     var thumb: URL? { (pictureSmall ?? pictureMedium ?? pictureLarge).flatMap(URL.init) }
     var wide: URL? { (backgroundMediumLarge ?? pictureLarge).flatMap(URL.init) }
+    /// `wide` at 400px, for episode rows (148pt), so they don't decode an 800px banner each
+    var wideSmall: URL? { backgroundMedium.flatMap(URL.init) ?? wide }
     var square: URL? { (pictureMedium ?? pictureLarge ?? pictureSmall).flatMap(URL.init) }
     /// NTS's image server crops to a centred square when the path says crop/ instead of resize/
     var cover: URL? { (pictureLarge ?? pictureMedium).flatMap { URL(string: $0.replacing(/resize\/\d+x\d+/, with: "crop/500x500")) } }
@@ -1018,7 +1020,7 @@ enum Keychain {
         }
         Task {
             if showEpisodes[id] == nil { showEpisodes[id] = try? await fetchEpisodes(id, offset: 0) }
-            cacheImages((showEpisodes[id] ?? []).prefix(3).map(\.media?.wide))   // what fits below the banner
+            cacheImages((showEpisodes[id] ?? []).prefix(3).map(\.media?.wideSmall))   // what fits below the banner
         }
     }
 
@@ -1297,14 +1299,17 @@ struct Rule: View {
 }
 
 /// Decoded artwork shared by every view, so one rebuilt (a poll, a tab switch, Now Playing's clock) draws at once
-/// instead of reloading through a shimmer and fade. NSCache evicts under memory pressure; a miss just reloads.
-nonisolated(unsafe) let imageCache: NSCache<NSURL, NSImage> = { let c = NSCache<NSURL, NSImage>(); c.countLimit = 150; return c }()
+/// instead of reloading through a shimmer and fade. Capped by decoded bytes (an 800px banner is ~2.5 MB; JPEGs decode
+/// on first draw into IOSurfaces Core Animation draws from directly) and evicted under memory pressure; a miss just
+/// reloads from URLSession's disk cache.
+nonisolated(unsafe) let imageCache: NSCache<NSURL, NSImage> = { let c = NSCache<NSURL, NSImage>(); c.totalCostLimit = 40 << 20; return c }()
 
 /// The image at `u`, from the cache or fetched into it.
 @MainActor func loadImage(_ u: URL) async -> NSImage? {
     if let img = imageCache.object(forKey: u as NSURL) { return img }
     guard let (d, _) = try? await URLSession.shared.data(from: u), let img = NSImage(data: d) else { return nil }
-    imageCache.setObject(img, forKey: u as NSURL)
+    let px = img.representations.first.map { $0.pixelsWide * $0.pixelsHigh } ?? 0
+    imageCache.setObject(img, forKey: u as NSURL, cost: px * 4)
     return img
 }
 
@@ -2110,7 +2115,7 @@ struct EpisodeRow: View {
         let item = Saved(id: id, title: d.name ?? "", subtitle: date, image: d.media?.thumb ?? image)
         let tags = (d.genres ?? []).map(\.value)
         HStack(alignment: .top, spacing: 10) {
-            Cover(url: (isEpisode ? d.media?.wide : d.media?.square) ?? image).frame(width: isEpisode ? 148 : 93, height: 93)
+            Cover(url: (isEpisode ? d.media?.wideSmall : d.media?.square) ?? image).frame(width: isEpisode ? 148 : 93, height: 93)
                 .overlay(alignment: .bottomLeading) {
                     if isEpisode { playIcon(id, 15, 17).frame(width: 49, height: 45).background(.black.opacity(0.75)) }
                 }
