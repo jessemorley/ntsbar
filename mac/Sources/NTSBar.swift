@@ -235,7 +235,6 @@ enum Keychain {
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     var schedules: [String: [Broadcast]] = [:]   // by channel: this week and next (/radio/schedule)
     @ObservationIgnored private var schedulesAt = Date.distantPast
-    var images: [URL: NSImage] = [:]   // show artwork prefetched on hover; Cover draws these at once
     var showEpisodes: [String: [Details]] = [:]   // a show's first page of episodes (raw), prefetched on hover
     @ObservationIgnored private var prefetching: Set<String> = []
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
@@ -253,7 +252,7 @@ enum Keychain {
         }
         Task {
             mixtapes = (try? await fetch("mixtapes")) ?? []
-            cacheImages(mixtapeImages)   // tiles + icons drawn at once
+            cacheImages(mixtapes.flatMap { [$0.media?.pictureMedium, $0.media?.iconWhite].map { $0.flatMap(URL.init) } })   // tiles + icons drawn at once
             await refreshMixtapeNow()
             // the tiles' 120px hover loops (~4 MB in all), kept on disk so hover plays at once
             let dir = URL.cachesDirectory.appending(path: "NTSBar/mixtape-videos")   // NTSBar/ itself is URLSession's cache
@@ -574,14 +573,9 @@ enum Keychain {
         }
     }
 
-    var mixtapeImages: [URL] { mixtapes.flatMap { [$0.media?.pictureMedium, $0.media?.iconWhite].compactMap { $0.flatMap(URL.init) } } }
-
+    /// Warms the shared image cache, side by side.
     private func cacheImages(_ urls: [URL?]) {
-        // ponytail: crude cap on decoded bitmaps (hover prefetches; mixtape tiles stay); an LRU if hover-browsing many shows matters
-        if images.count > 100 { let keep = Set(mixtapeImages); images = images.filter { keep.contains($0.key) } }
-        for case let u? in urls where images[u] == nil {
-            Task { if let (d, _) = try? await URLSession.shared.data(from: u), let img = NSImage(data: d) { images[u] = img } }
-        }
+        for case let u? in urls { Task { _ = await loadImage(u) } }
     }
 
     /// Both channels' schedules, refetched once over 15 min old (the API's max-age); a failure retries next call.
@@ -841,38 +835,61 @@ struct Rule: View {
     var body: some View { Rectangle().fill(.white.opacity(0.2)).frame(height: 1) }
 }
 
+/// Decoded artwork shared by every view, so one rebuilt (a poll, a tab switch, Now Playing's clock) draws at once
+/// instead of reloading through a shimmer and fade. NSCache evicts under memory pressure; a miss just reloads.
+nonisolated(unsafe) let imageCache: NSCache<NSURL, NSImage> = { let c = NSCache<NSURL, NSImage>(); c.countLimit = 150; return c }()
+
+/// The image at `u`, from the cache or fetched into it.
+@MainActor func loadImage(_ u: URL) async -> NSImage? {
+    if let img = imageCache.object(forKey: u as NSURL) { return img }
+    guard let (d, _) = try? await URLSession.shared.data(from: u), let img = NSImage(data: d) else { return nil }
+    imageCache.setObject(img, forKey: u as NSURL)
+    return img
+}
+
+/// A remote image: cached ones on the first frame; new ones shimmer (unless `fit`, for icons), then fade in.
+struct RemoteImage: View {
+    let url: URL?, fit: Bool
+    @State private var image: NSImage?
+    @State private var failed = false
+    init(url: URL?, fit: Bool = false) {
+        self.url = url; self.fit = fit
+        _image = State(initialValue: url.flatMap { imageCache.object(forKey: $0 as NSURL) })   // a lookup, no decode
+    }
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(nsImage: image).resizable().interpolation(.high).aspectRatio(contentMode: fit ? .fit : .fill).transition(.opacity)
+            } else if url != nil && !failed && !fit {
+                Shimmer().opacity(0.08)   // loading; failed or no artwork stays plain grey
+            }
+        }
+        .task(id: url) {
+            guard let url else { image = nil; return }
+            if let c = imageCache.object(forKey: url as NSURL) { image = c; return }
+            image = nil; failed = false
+            let img = await loadImage(url)
+            withAnimation(.easeOut(duration: 0.25)) { image = img }
+            failed = img == nil
+        }
+    }
+}
+
 /// Image that fills a fixed frame without pushing the layout wider.
 struct Cover: View {
-    @Environment(Store.self) var store
     let url: URL?
     var body: some View {
         Color(white: 0.12)
             // .clipped() hides the fill's overflow but it still takes clicks (e.g. a card's image over the play button above it)
-            .overlay {
-                Group {
-                    if let img = url.flatMap({ store.images[$0] }) { Image(nsImage: img).resizable().scaledToFill() }   // prefetched: no async gap
-                    else {
-                        // arrivals fade in over the shimmer rather than popping
-                        AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.25))) { phase in
-                            if let img = phase.image { img.resizable().scaledToFill().transition(.opacity) }
-                            else if url != nil && phase.error == nil { Shimmer().opacity(0.08) }   // loading; failed or no artwork stays plain grey
-                        }
-                    }
-                }
-                .allowsHitTesting(false)
-            }
+            .overlay { RemoteImage(url: url).allowsHitTesting(false) }
             .clipped()
     }
 }
 
-/// A small image fitted whole (mixtape icons); prefetched ones draw at once.
+/// A small image fitted whole (mixtape icons).
 struct Icon: View {
-    @Environment(Store.self) var store
     let url: URL?
-    var body: some View {
-        if let img = url.flatMap({ store.images[$0] }) { Image(nsImage: img).resizable().interpolation(.high).scaledToFit() }
-        else { AsyncImage(url: url) { $0.resizable().interpolation(.high).scaledToFit() } placeholder: { Color.clear } }
-    }
+    var body: some View { RemoteImage(url: url, fit: true) }
 }
 
 // Layout measured from the NTS iPhone app (402pt wide), scaled to our 360pt popover.
