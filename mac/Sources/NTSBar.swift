@@ -219,9 +219,19 @@ struct SonosRoom: Hashable {
         // audioBroadcast + the radio cdudn: the Sonos app shows the title as a station
         let didl = #"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="R:0/0/0" parentID="R:0/0" restricted="true"><dc:title>"#
             + esc(title) + #"</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc></item></DIDL-Lite>"#
-        let uri = "x-rincon-mp3radio://" + url.absoluteString.replacing(/^https?:\/\//, with: "")   // Sonos follows the geo redirects itself
-        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(uri))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
+        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(Self.uri(url.absoluteString)))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
         _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+    }
+
+    /// How Sonos names a stream we gave it; it keeps this as CurrentURI while following the geo redirects itself.
+    static func uri(_ url: String) -> String { "x-rincon-mp3radio://" + url.replacing(/^https?:\/\//, with: "") }
+
+    /// The stream the room is playing (or starting), nil when stopped or paused.
+    func playingURI() async throws -> String? {
+        let state = try await Self.soap(host, "MediaRenderer/AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+        guard state.contains("<CurrentTransportState>PLAYING") || state.contains("<CurrentTransportState>TRANSITIONING") else { return nil }
+        let media = try await Self.soap(host, "MediaRenderer/AVTransport", "GetMediaInfo", "<InstanceID>0</InstanceID>")
+        return media.firstMatch(of: /<CurrentURI>([^<]*)/).map { String($0.1).replacing("&amp;", with: "&") }
     }
 
     func stop() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Stop", "<InstanceID>0</InstanceID>") }
@@ -315,6 +325,7 @@ enum Keychain {
         Task {
             mixtapes = (try? await fetch("mixtapes")) ?? []
             cacheImages(mixtapes.flatMap { [$0.media?.pictureMedium, $0.media?.iconWhite].map { $0.flatMap(URL.init) } })   // tiles + icons drawn at once
+            await findRooms()   // at launch, so the remembered room is ready before the first play; after mixtapes, to recognise one playing there
             await refreshMixtapeNow()
             // the tiles' 120px hover loops (~4 MB in all), kept on disk so hover plays at once
             let dir = URL.cachesDirectory.appending(path: "NTSBar/mixtape-videos")   // NTSBar/ itself is URLSession's cache
@@ -364,8 +375,8 @@ enum Keychain {
 
     @ObservationIgnored private var streamURL: URL?
 
-    var rooms: [SonosRoom] = []   // found when the mini player shows
-    var speaker: SonosRoom?   // chosen output for live and mixtapes; nil plays on this Mac
+    var rooms: [SonosRoom] = []   // found at launch and again whenever the mini player shows
+    var speaker: SonosRoom? { didSet { UserDefaults.standard.set(speaker?.name, forKey: "speaker") } }   // chosen output for live and mixtapes; nil plays on this Mac
     var cast: SonosRoom?   // the room actually playing our stream now
 
     /// Starts the playing item's stream: on the chosen Sonos room for live and mixtapes, else (and for archive episodes) on the Mac.
@@ -389,7 +400,20 @@ enum Keychain {
         Task { try? await c.stop() }
     }
 
-    func findRooms() async { rooms = await SonosRoom.discover() }
+    /// Picks the remembered room back up by name: its coordinator's address can change (DHCP, regrouping).
+    /// A remembered room that's offline stays remembered, the Mac plays meanwhile.
+    func findRooms() async {
+        guard !CommandLine.arguments.contains("--snapshot") else { return }   // a playing room would take over the snapshot
+        rooms = await SonosRoom.discover()
+        let name = speaker?.name ?? UserDefaults.standard.string(forKey: "speaker")
+        if let r = rooms.first(where: { $0.name == name }), r != speaker { setSpeaker(r) }
+        // The room still playing an NTS stream (from before a relaunch, or picked in the Sonos app): shown here so pause and stop work
+        guard playingID == nil, let s = speaker, let uri = try? await s.playingURI(), playingID == nil,
+              let (id, url) = (liveStreams.map { ($0.key, $0.value) } + mixtapes.map { ($0.id, $0.audioStreamEndpoint) })
+                .first(where: { SonosRoom.uri($0.1) == uri }) else { return }
+        playingID = id; streamURL = URL(string: url); cast = s; paused = false; streamError = nil
+        nowPlaying()
+    }
 
     /// Moves a playing live stream or mixtape to the new output straight away.
     func setSpeaker(_ s: SonosRoom?) {
