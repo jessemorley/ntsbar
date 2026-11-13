@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import MediaPlayer
+import Network
 
 // MARK: - API (undocumented, same endpoints nts.live uses)
 
@@ -178,6 +179,67 @@ struct APIError: LocalizedError { var errorDescription: String? }
     return (v("title"), show.isEmpty ? nil : "/shows/\(show)" + (ep.isEmpty ? "" : "/episodes/\(ep)"))
 }
 
+// MARK: - Sonos (local UPnP on :1400, no account)
+
+/// A Sonos room or group, addressed by its coordinator: only the coordinator takes transport commands.
+/// The speaker fetches the stream itself, so this suits the MP3 live and mixtape streams; archive HLS stays on the Mac.
+struct SonosRoom: Hashable {
+    let name: String, host: String
+
+    /// Every room on the network: any speaker found over Bonjour reports the whole household's groups.
+    static func discover() async -> [SonosRoom] {
+        let b = NWBrowser(for: .bonjourWithTXTRecord(type: "_sonos._tcp", domain: nil), using: .tcp)
+        let hosts = AsyncStream<String> { c in
+            b.browseResultsChangedHandler = { results, _ in
+                for r in results { if case .bonjour(let t) = r.metadata, let h = t["location"].flatMap(URL.init(string:))?.host() { c.yield(h) } }
+            }
+            b.stateUpdateHandler = { s in switch s { case .failed, .cancelled: c.finish(); default: break } }
+            b.start(queue: .main)
+        }
+        let timeout = Task { try? await Task.sleep(for: .seconds(3)); b.cancel() }   // nothing found (or the Local Network prompt still up)
+        defer { timeout.cancel(); b.cancel() }
+        guard let host = await hosts.first(where: { _ in true }),
+              let xml = try? await soap(host, "ZoneGroupTopology", "GetZoneGroupState") else { return [] }
+        func attr(_ tag: Substring, _ k: String) -> String? {
+            (try? Regex<(Substring, Substring)>(" \(k)=\"([^\"]*)\"")).flatMap { tag.firstMatch(of: $0)?.1 }.map(String.init)
+        }
+        let state = xml.replacing("&lt;", with: "<").replacing("&gt;", with: ">").replacing("&quot;", with: "\"").replacing("&amp;", with: "&")
+        return state.matches(of: /<ZoneGroup Coordinator="([^"]+)"[^>]*>(.*?)<\/ZoneGroup>/.dotMatchesNewlines()).compactMap { g in
+            let members = g.2.matches(of: /<ZoneGroupMember [^>]*>/).map(\.0)
+            guard let lead = members.first(where: { attr($0, "UUID") == String(g.1) }),
+                  let host = attr(lead, "Location").flatMap(URL.init(string:))?.host() else { return nil }
+            var names: [String] = []   // a stereo pair's second speaker is Invisible and shares the room's name
+            for m in members where attr(m, "Invisible") != "1" { if let n = attr(m, "ZoneName"), !names.contains(n) { names.append(n) } }
+            return names.isEmpty ? nil : SonosRoom(name: names.joined(separator: " + "), host: host)
+        }.sorted { $0.name < $1.name }
+    }
+
+    func play(_ url: URL, title: String) async throws {
+        func esc(_ s: String) -> String { s.replacing("&", with: "&amp;").replacing("<", with: "&lt;").replacing(">", with: "&gt;").replacing("\"", with: "&quot;") }
+        // audioBroadcast + the radio cdudn: the Sonos app shows the title as a station
+        let didl = #"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="R:0/0/0" parentID="R:0/0" restricted="true"><dc:title>"#
+            + esc(title) + #"</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc></item></DIDL-Lite>"#
+        let uri = "x-rincon-mp3radio://" + url.absoluteString.replacing(/^https?:\/\//, with: "")   // Sonos follows the geo redirects itself
+        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(uri))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
+        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+    }
+
+    func stop() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Stop", "<InstanceID>0</InstanceID>") }
+
+    private static func soap(_ host: String, _ path: String, _ action: String, _ args: String = "") async throws -> String {
+        let service = path.split(separator: "/").last!
+        var r = URLRequest(url: URL(string: "http://\(host):1400/\(path)/Control")!, timeoutInterval: 5)
+        r.httpMethod = "POST"
+        r.setValue(#"text/xml; charset="utf-8""#, forHTTPHeaderField: "Content-Type")
+        r.setValue("\"urn:schemas-upnp-org:service:\(service):1#\(action)\"", forHTTPHeaderField: "SOAPACTION")
+        r.httpBody = Data(#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>"#
+            .appending("<u:\(action) xmlns:u=\"urn:schemas-upnp-org:service:\(service):1\">\(args)</u:\(action)></s:Body></s:Envelope>").utf8)
+        let (data, resp) = try await URLSession.shared.data(for: r)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw APIError(errorDescription: "Sonos \(action) failed") }
+        return String(decoding: data, as: UTF8.self)
+    }
+}
+
 /// The refresh token lives in the Keychain; it's the long-lived credential.
 enum Keychain {
     static var query: [String: Any] {
@@ -293,15 +355,49 @@ enum Keychain {
         retries = 0; retrying = false   // a new stream's failures count afresh, even mid-wait
         streamURL = u
         duration = 0
-        player.replaceCurrentItem(with: AVPlayerItem(url: u))
-        player.play()
         playingID = id
+        load(u)
         paused = false
         mixtapeNow = nil
         Task { await refreshMixtapeNow() }
     }
 
     @ObservationIgnored private var streamURL: URL?
+
+    var rooms: [SonosRoom] = []   // found when the mini player shows
+    var speaker: SonosRoom?   // chosen output for live and mixtapes; nil plays on this Mac
+    var cast: SonosRoom?   // the room actually playing our stream now
+
+    /// Starts the playing item's stream: on the chosen Sonos room for live and mixtapes, else (and for archive episodes) on the Mac.
+    private func load(_ u: URL) {
+        if let c = cast, c != speaker || episode?.id == playingID { stopCast(c) }
+        guard let s = speaker, episode?.id != playingID else { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play(); return }
+        player.replaceCurrentItem(with: nil)
+        cast = s
+        let id = playingID, title = mixtapes.first { $0.id == id }?.title ?? "NTS \(id ?? "")"
+        Task {
+            do { try await s.play(u, title: title) } catch {
+                guard cast == s, playingID == id else { return }
+                cast = nil; paused = true; streamError = "Can't reach \(s.name)"; nowPlaying()
+            }
+        }
+    }
+
+    private func stopCast(_ c: SonosRoom? = nil) {
+        guard let c = c ?? cast else { return }
+        if cast == c { cast = nil }
+        Task { try? await c.stop() }
+    }
+
+    func findRooms() async { rooms = await SonosRoom.discover() }
+
+    /// Moves a playing live stream or mixtape to the new output straight away.
+    func setSpeaker(_ s: SonosRoom?) {
+        guard s != speaker else { return }
+        speaker = s
+        if playingID != nil, !paused, episode?.id != playingID, let u = streamURL { load(u) }
+    }
+
     @ObservationIgnored private var statusObserver: NSKeyValueObservation?
     @ObservationIgnored private var itemObserver: NSKeyValueObservation?
 
@@ -355,16 +451,16 @@ enum Keychain {
     }
 
     func stop() {
-        listenStop(); player.pause(); playingID = nil; pendingID = nil
+        listenStop(); player.pause(); stopCast(); playingID = nil; pendingID = nil
         nowPlaying()
     }
 
     /// Archive episodes resume where they paused; live streams and mixtapes reload at the live edge.
     func pauseResume() {
         defer { nowPlaying() }
-        if !paused { listenStop(); player.pause() }
+        if !paused { listenStop(); player.pause(); stopCast() }
         else if episode?.id == playingID && streamError == nil { player.play(); paused = false; listenStart(); return }   // ponytail: a failed episode retries from the start, seek back if that annoys
-        else if let u = streamURL { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play() }
+        else if let u = streamURL { load(u) }
         paused.toggle()
         streamError = nil
     }
@@ -1987,12 +2083,28 @@ struct MiniPlayer: View {
                     }
                 }
                 Spacer(minLength: 8)
+                if !store.rooms.isEmpty {
+                    Menu {
+                        Picker("Play on", selection: Binding(get: { store.speaker }, set: { store.setSpeaker($0) })) {
+                            Text("This Mac").tag(SonosRoom?.none)
+                            ForEach(store.rooms, id: \.self) { Text($0.name).tag(Optional($0)) }
+                        }
+                        .pickerStyle(.inline)
+                        Text("Sonos plays live and mixtapes; episodes stay on this Mac")
+                    } label: {
+                        Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14))
+                    }
+                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+                    .help(store.cast.map { "Playing on \($0.name)" } ?? "Play on Sonos")
+                    .padding(.trailing, 14)
+                }
                 Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
             }
             .contentShape(.rect)
             .onTapGesture(perform: open)
             .task(id: episode(at: ctx.date)?.path) { if let p = episode(at: .now)?.path { await store.loadTracklist(p) } }
         }
+        .task { await store.findRooms() }   // each time it shows, so regrouped rooms are current
         .frame(height: miniHeight)
         .overlay(alignment: .top) { ProgressLine() }
     }
