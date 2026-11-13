@@ -1294,11 +1294,12 @@ struct RemoteImage: View {
         .task(id: url) {
             guard let url else { image = nil; return }
             if let c = imageCache.object(forKey: url as NSURL) { image = c; return }
-            image = nil; failed = false
+            // keep the current image (e.g. a My NTS row's feed thumb) until the new one is in, swapped without a blank or fade
+            failed = false
             let img = await loadImage(url)
             guard !Task.isCancelled else { return }   // superseded by a newer url; don't blank its image
-            withAnimation(.easeOut(duration: 0.25)) { image = img }
-            failed = img == nil
+            if image == nil { withAnimation(.easeOut(duration: 0.25)) { image = img } } else if let img { image = img }
+            failed = image == nil
         }
     }
 }
