@@ -231,7 +231,7 @@ enum Keychain {
     var feeds: [SavedTab: Feed] = [:]   // account lists, paged in as you scroll
     var problem: String?
     var streamError: String?   // shown in the mini player while the failed item sits paused
-    var showTracklist = false   // Now Playing shows the tracklist in place of the episode page (the mini player's track opens it)
+    var showTracklist = false   // Now Playing shows the tracklist in place of the episode page
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     var schedules: [String: [Broadcast]] = [:]   // by channel: this week and next (/radio/schedule)
     @ObservationIgnored private var schedulesAt = Date.distantPast
@@ -1939,13 +1939,7 @@ struct MiniPlayer: View {
                     if let err = store.streamError {
                         Text(err).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).help(err)
                     } else if let track {
-                        Button {   // straight to the tracklist
-                            // on Now Playing already: slide the tracklist in; from elsewhere the page opens straight onto it
-                            if expanded { push { store.showTracklist = true } } else { store.showTracklist = true; open() }
-                        } label: {
-                            Text(track.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
-                        }
-                        .buttonStyle(.plain)
+                        Text(track.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)   // tap opens Now Playing, as the rest of the bar
                     } else {
                         Text(info.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
                     }
