@@ -526,6 +526,7 @@ enum Keychain {
         listenStop()
         streamError = nil
         retries = 0; retrying = false   // a new stream's failures count afresh, even mid-wait
+        noSonos = false
         streamURL = u
         duration = 0
         playingID = id
@@ -544,6 +545,7 @@ enum Keychain {
     var rooms: [SonosRoom] = []   // found at launch and again whenever the mini player shows
     var speaker: SonosRoom? { didSet { UserDefaults.standard.set(speaker?.name, forKey: "speaker") } }   // chosen output for live and mixtapes; nil plays on this Mac
     var cast: SonosRoom?   // the room actually playing our stream now
+    var noSonos = false   // the playing episode can't be relayed (Mixcloud): rooms grey out until something else plays
     var volume: Int?   // the chosen room's, read when it's picked or the rooms are looked up again
     @ObservationIgnored private var relay: EpisodeRelay?   // set while an archive episode plays on Sonos
     @ObservationIgnored private var castClock: (pos: Double, at: Date)?   // that episode's position, as of a moment: counted here, corrected by watch
@@ -588,6 +590,7 @@ enum Keychain {
             do { try await r.start(for: s.host, path: id ?? "/episode") } catch {
                 guard relay === r else { return r.stop() }
                 stopCast(s)   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it, and the room stops what it had on
+                noSonos = true
                 return playHere(u, at: start)
             }
             guard relay === r, let url = r.url else { return r.stop() }
@@ -2465,7 +2468,8 @@ struct SpeakerButton: View {
     }
 
     func row(_ name: String, _ room: SonosRoom?) -> some View {
-        Button { store.setSpeaker(room) } label: {
+        let off = room != nil && store.noSonos && store.playingID != nil
+        return Button { store.setSpeaker(room) } label: {
             HStack {
                 Text(name.nts).font(.nts(13)).lineLimit(1)
                 Spacer()
@@ -2475,6 +2479,8 @@ struct SpeakerButton: View {
             .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .disabled(off).opacity(off ? 0.4 : 1)
+        .help(off ? "This episode can't play on Sonos" : "")
     }
 }
 
