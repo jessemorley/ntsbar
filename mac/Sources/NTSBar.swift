@@ -2410,24 +2410,29 @@ struct MiniPlayer: View {
 struct SpeakerButton: View {
     @Environment(Store.self) var store
     @State private var open = false
+    @State private var airplay = 0   // bumped to open the system AirPlay list from this button
 
     var body: some View {
         Button { open.toggle() } label: {
             Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14)).contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .background { AirPlayPicker(player: store.player, show: airplay) { store.setSpeaker(nil) } }   // under the button, so it never takes its clicks
         .help(store.cast.map { "Playing on \($0.name)" } ?? "Sonos or AirPlay")
         .popover(isPresented: $open, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 2) {
                 row("This Mac", nil)
                 ForEach(store.rooms, id: \.self) { row($0.name, $0) }
-                HStack {
-                    Text("AirPlay".nts).font(.nts(13))
-                    Spacer()
-                    Image(systemName: "airplay.audio").font(.system(size: 12))
+                // swaps this popover for the system list, so only one is up at a time
+                Button { open = false; airplay += 1 } label: {
+                    HStack {
+                        Text("AirPlay".nts).font(.nts(13))
+                        Spacer()
+                        Image(systemName: "airplay.audio").font(.system(size: 12))
+                    }
+                    .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
                 }
-                .padding(.horizontal, 8).frame(height: 26)
-                .overlay { AirPlayPicker(player: store.player) { store.setSpeaker(nil) } }
+                .buttonStyle(.plain)
                 if store.speaker != nil {
                     HStack(spacing: 8) {
                         Image(systemName: "speaker.fill").font(.system(size: 11)).opacity(0.6)
@@ -2458,12 +2463,13 @@ struct SpeakerButton: View {
     }
 }
 
-/// The system AirPlay menu for the Mac's player, laid invisibly over a row so the whole row opens it (its button fills its frame).
-/// AirPlay carries the Mac's player, so picking a device switches off Sonos; just opening the menu changes nothing.
+/// The system AirPlay list for the Mac's player, from an invisible picker that opens it when `show` changes.
+/// AirPlay carries the Mac's player, so picking a device switches off Sonos; just opening the list changes nothing.
 struct AirPlayPicker: NSViewRepresentable {
-    let player: AVPlayer, picked: () -> Void
+    let player: AVPlayer, show: Int, picked: () -> Void
     @MainActor final class Coordinator: NSObject, @preconcurrency AVRoutePickerViewDelegate {   // AppKit calls it on the main thread
         var picked: () -> Void = {}
+        var shown = 0
         func routePickerViewDidEndPresentingRoutes(_ v: AVRoutePickerView) {
             // No public way to read the chosen route: isExternalPlaybackActive, or the picker's own flag (private, so asked for warily)
             Task {
@@ -2481,7 +2487,14 @@ struct AirPlayPicker: NSViewRepresentable {
         v.delegate = context.coordinator
         return v
     }
-    func updateNSView(_ v: AVRoutePickerView, context: Context) { v.player = player; context.coordinator.picked = picked }
+    func updateNSView(_ v: AVRoutePickerView, context: Context) {
+        v.player = player; context.coordinator.picked = picked
+        guard show != context.coordinator.shown else { return }
+        context.coordinator.shown = show
+        // No public call opens the list: click the picker's own button (an NSButton), once the app's popover has gone.
+        // A macOS that changes its insides just leaves the row doing nothing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { (v.subviews.first as? NSButton)?.performClick(nil) }
+    }
 }
 
 /// Artwork with the show info below it, as on the NTS iPhone show page (sizes measured from it, ×0.896).
