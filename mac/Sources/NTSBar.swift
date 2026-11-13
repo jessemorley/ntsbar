@@ -279,6 +279,7 @@ enum Keychain {
             where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
         if !CommandLine.arguments.contains("--snapshot") { remoteCommands() }
+        if email != nil { Task { await loadMore(.hosts) } }   // My NTS opens on Hosts, and the schedule's following tab needs it
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
@@ -1541,8 +1542,12 @@ struct SavedView: View {
             LazyVStack(alignment: .leading, spacing: 0) {
                 if store.email == nil { AccountView() }
                 let loading = store.feeds[tab]?.loading == true
+                // the account's first page not in yet (or not even asked for: no "nothing saved" flash before the fetch starts)
+                let first = store.email != nil && items.isEmpty && (store.feeds[tab] == nil || loading)
                 if tab == .history && store.email == nil {
                     empty("SIGN IN FOR HISTORY")
+                } else if first {
+                    ForEach(0..<5, id: \.self) { _ in SkeletonRow(square: tab == .hosts); Rule().padding(.horizontal, pageInset) }
                 } else if items.isEmpty && !loading {
                     empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
                 }
@@ -1552,7 +1557,7 @@ struct SavedView: View {
                         .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
                     Rule().padding(.horizontal, pageInset)
                 }
-                if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                if loading && !first { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
             }
         }
         .modifier(HidesTabs(extra: headerHeight))
@@ -1796,11 +1801,12 @@ func fetchEpisodes(_ show: String, offset: Int) async throws -> [Details] {
                        query: [.init(name: "offset", value: String(offset)), .init(name: "limit", value: String(episodePage))]).results
 }
 
-/// Stand-in for an EpisodeRow while a show's first episodes load.
+/// Stand-in for an EpisodeRow while a first page loads; `square` for shows' artwork.
 struct SkeletonRow: View {
+    var square = false
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Color(white: 0.12).frame(width: 148, height: 93).overlay { Shimmer().opacity(0.08) }.clipped()
+            Color(white: 0.12).frame(width: square ? 93 : 148, height: 93).overlay { Shimmer().opacity(0.08) }.clipped()
             VStack(alignment: .leading, spacing: 8) {
                 Color(white: 0.12).frame(width: 130, height: 13)
                 Color(white: 0.12).frame(width: 70, height: 9)
