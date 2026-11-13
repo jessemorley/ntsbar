@@ -15,6 +15,8 @@ struct Media: Decodable {
     var thumb: URL? { (pictureSmall ?? pictureMedium ?? pictureLarge).flatMap(URL.init) }
     var wide: URL? { (backgroundMediumLarge ?? pictureLarge).flatMap(URL.init) }
     var square: URL? { (pictureMedium ?? pictureLarge ?? pictureSmall).flatMap(URL.init) }
+    /// NTS's image server crops to a centred square when the path says crop/ instead of resize/
+    var cover: URL? { (pictureLarge ?? pictureMedium).flatMap { URL(string: $0.replacing(/resize\/\d+x\d+/, with: "crop/500x500")) } }
 }
 struct Tag: Decodable { var value: String }
 struct Details: Decodable {
@@ -186,7 +188,7 @@ struct APIError: LocalizedError { var errorDescription: String? }
 /// A Sonos room or group, addressed by its coordinator: only the coordinator takes transport commands.
 /// The speaker fetches the stream itself, so this suits the MP3 live and mixtape streams; archive HLS stays on the Mac.
 struct SonosRoom: Hashable {
-    let name: String, host: String
+    let name: String, host: String, uuid: String   // the coordinator's, which names its queue
 
     /// Every room on the network: any speaker found over Bonjour reports the whole household's groups.
     static func discover() async -> [SonosRoom] {
@@ -212,20 +214,29 @@ struct SonosRoom: Hashable {
                   let host = attr(lead, "Location").flatMap(URL.init(string:))?.host() else { return nil }
             var names: [String] = []   // a stereo pair's second speaker is Invisible and shares the room's name
             for m in members where attr(m, "Invisible") != "1" { if let n = attr(m, "ZoneName"), !names.contains(n) { names.append(n) } }
-            return names.isEmpty ? nil : SonosRoom(name: names.joined(separator: " + "), host: host)
+            return names.isEmpty ? nil : SonosRoom(name: names.joined(separator: " + "), host: host, uuid: String(g.1))
         }.sorted { $0.name < $1.name }
     }
 
     /// A stream as a radio station; a file (an archive episode, via EpisodeRelay) as a track, so it can pause and seek.
-    func play(_ url: URL, title: String, file: Bool = false) async throws {
+    func play(_ url: URL, title: String, art: URL? = nil, file: Bool = false) async throws {
         func esc(_ s: String) -> String { s.replacing("&", with: "&amp;").replacing("<", with: "&lt;").replacing(">", with: "&gt;").replacing("\"", with: "&quot;") }
-        // audioBroadcast + the radio cdudn: the Sonos app shows the title as a station
-        let kind = file ? "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
-            : #"<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc>"#
-        let didl = #"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="R:0/0/0" parentID="R:0/0" restricted="true"><dc:title>"#
-            + esc(title) + "</dc:title>" + kind + "</item></DIDL-Lite>"
         let uri = file ? url.absoluteString : Self.uri(url.absoluteString)
-        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(uri))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
+        // audioBroadcast + the radio cdudn: the Sonos app shows the title as a station.
+        // A track needs a <res> and a non-radio id, or the app shows "No content".
+        let kind = file ? #"<upnp:class>object.item.audioItem.musicTrack</upnp:class><dc:creator>NTS</dc:creator><res protocolInfo="http-get:*:audio/mpeg:*">"# + esc(uri) + "</res>"
+            : #"<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc>"#
+        let id = file ? #"id="-1" parentID="-1""# : #"id="R:0/0/0" parentID="R:0/0""#
+        let didl = #"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item "#
+            + id + #" restricted="true"><dc:title>"# + esc(title) + "</dc:title>"
+            + (art.map { "<upnp:albumArtURI>" + esc($0.absoluteString) + "</upnp:albumArtURI>" } ?? "") + kind + "</item></DIDL-Lite>"
+        if file {   // played from the queue (replacing it): the Sonos app shows "No content" for a track set directly
+            _ = try await Self.soap(host, "MediaRenderer/AVTransport", "RemoveAllTracksFromQueue", "<InstanceID>0</InstanceID>")
+            _ = try await Self.soap(host, "MediaRenderer/AVTransport", "AddURIToQueue", "<InstanceID>0</InstanceID><EnqueuedURI>\(esc(uri))</EnqueuedURI><EnqueuedURIMetaData>\(esc(didl))</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued><EnqueueAsNext>0</EnqueueAsNext>")
+            _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>x-rincon-queue:\(uuid)#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>")
+        } else {
+            _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(uri))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
+        }
         try await resume()
     }
 
@@ -259,7 +270,10 @@ struct SonosRoom: Hashable {
         let playing = state.contains("<CurrentTransportState>PLAYING") || state.contains("<CurrentTransportState>TRANSITIONING")
         guard playing || state.contains("<CurrentTransportState>PAUSED_PLAYBACK") else { return nil }
         let media = try await Self.soap(host, "MediaRenderer/AVTransport", "GetMediaInfo", "<InstanceID>0</InstanceID>")
-        return media.firstMatch(of: /<CurrentURI>([^<]*)/).map { (String($0.1).replacing("&amp;", with: "&"), playing) }
+        guard let uri = media.firstMatch(of: /<CurrentURI>([^<]*)/).map({ String($0.1).replacing("&amp;", with: "&") }) else { return nil }
+        // an episode plays from the queue: the track it's on says which
+        if uri.hasPrefix("x-rincon-queue:"), let track = try await position().track { return (track, playing) }
+        return (uri, playing)
     }
 
     func stop() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Stop", "<InstanceID>0</InstanceID>") }
@@ -300,6 +314,22 @@ struct SonosRoom: Hashable {
     private(set) var seconds: Double = 0
     private var template = "", size = 0
     private let playlist: URL, refresh: () async throws -> URL
+    /// Sonos ignores our DIDL for an HTTP MP3 and names it from its ID3 (else the filename, and the app says "No content"),
+    /// so the served file starts with a tag of its own: byte offsets past it map to SoundCloud's MP3 shifted by its length.
+    private var tag = Data()
+
+    /// An ID3v2.3 tag with UTF-16 text frames.
+    static func id3(_ frames: [String: String]) -> Data {
+        func be(_ n: Int, synchsafe: Bool) -> [UInt8] {
+            synchsafe ? [24, 16, 8, 0].map { UInt8(n >> ($0 / 8 * 7) & 0x7f) } : [24, 16, 8, 0].map { UInt8(n >> $0 & 0xff) }
+        }
+        var body = Data()
+        for (id, text) in frames.sorted(by: { $0.key < $1.key }) {
+            let value: [UInt8] = [1, 0xff, 0xfe] + text.utf16.flatMap { [UInt8($0 & 0xff), UInt8($0 >> 8)] } + [0, 0]
+            body += Data(id.utf8) + be(value.count, synchsafe: false) + [0, 0] + value
+        }
+        return Data("ID3".utf8) + [3, 0, 0] + be(body.count, synchsafe: true) + body
+    }
     private var listener: NWListener?
     private var awake: NSObjectProtocol?
     private static let session = URLSession(configuration: .ephemeral)   // pieces kept out of the app's disk cache
@@ -309,8 +339,9 @@ struct SonosRoom: Hashable {
     /// Reads the playlist and starts listening; throws for a stream that isn't SoundCloud's MP3 ranges (play it on the Mac).
     /// `path` (the episode's id) goes in the URL so a relaunched app can tell what the room is playing,
     /// and `port` takes back the one in that URL, so the room carries on reading from the new relay.
-    func start(for speaker: String, path: String, port wanted: UInt16? = nil) async throws {
+    func start(for speaker: String, path: String, title: String, port wanted: UInt16? = nil) async throws {
         try await read(playlist)
+        tag = Self.id3(["TIT2": title, "TPE1": "NTS"])
         // the address this Mac reaches the speaker from
         let probe = NWConnection(host: .init(speaker), port: 1400, using: .tcp)
         defer { probe.cancel() }
@@ -391,6 +422,7 @@ struct SonosRoom: Hashable {
                 c.send(content: d, completion: .contentProcessed { e in if let e { k.resume(throwing: e) } else { k.resume() } })
             }
         }
+        let size = tag.count + self.size, t = tag.count
         let range = head.firstMatch(of: /(?im)^range:\s*bytes=(\d+)-(\d*)/)
         let from = range.flatMap { Int($0.1) } ?? 0, to = min(range.flatMap { Int($0.2) } ?? size - 1, size - 1)
         guard from <= to else { try? await send(Data("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(size)\r\nConnection: close\r\n\r\n".utf8)); return }
@@ -399,10 +431,11 @@ struct SonosRoom: Hashable {
         do {
             try await send(Data((h + "\r\n").utf8))
             guard !head.hasPrefix("HEAD") else { return }
-            var at = from
+            if from < t { try await send(tag[from...min(to, t - 1)]) }
+            var at = max(from, t)
             while at <= to, listener != nil {   // a send fails once the speaker hangs up (it seeked or stopped)
                 let end = min(at + 150_000 - 1, to)
-                try await send(try await piece(at, end))
+                try await send(try await piece(at - t, end - t))
                 at = end + 1
             }
         } catch {}
@@ -580,14 +613,16 @@ enum Keychain {
         cast = s
         let id = playingID
         guard episode?.id == id, let source = episode?.details.source else {
-            let title = mixtapes.first { $0.id == id }?.title ?? "NTS \(id ?? "")"
-            Task { do { try await s.play(u, title: title) } catch { castFailed(s, id) } }
+            let mix = mixtapes.first { $0.id == id }, show = live.first { $0.id == id }?.now
+            let art = (mix?.media ?? show?.embeds?.details?.media)?.cover
+            // a live stream's top line is its own "NTS 1 - show" metadata (follows the schedule); ours is the line under it
+            Task { do { try await s.play(u, title: mix?.title ?? "NTS \(id ?? "")", art: art) } catch { castFailed(s, id) } }
             return
         }
         let r = EpisodeRelay(playlist: u) { try await resolveStream(source) }
         relay = r; castClock = (start, .now); r.playing = !paused
         Task {
-            do { try await r.start(for: s.host, path: id ?? "/episode") } catch {
+            do { try await r.start(for: s.host, path: id ?? "/episode", title: episode?.details.name ?? "NTS") } catch {
                 guard relay === r else { return r.stop() }
                 stopCast(s)   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it, and the room stops what it had on
                 noSonos = true
@@ -596,7 +631,7 @@ enum Keychain {
             guard relay === r, let url = r.url else { return r.stop() }
             duration = r.seconds; nowPlaying()
             do {
-                try await s.play(url, title: episode?.details.name ?? "NTS", file: true)
+                try await s.play(url, title: episode?.details.name ?? "NTS", art: episode?.details.media?.cover, file: true)
                 if start > 0 { try await s.seek(start) }
                 guard relay === r else { return }
                 if paused { try await s.pause() }   // paused while it started
@@ -684,7 +719,7 @@ enum Keychain {
               let hls = try? await resolveStream(source), playingID == nil else { return }
         let r = EpisodeRelay(playlist: hls) { try await resolveStream(source) }
         // another Mac's relay, or the port's taken: not ours to pick up
-        guard (try? await r.start(for: s.host, path: id, port: port)) != nil, r.url?.absoluteString == uri, playingID == nil,
+        guard (try? await r.start(for: s.host, path: id, title: d.name ?? "NTS", port: port)) != nil, r.url?.absoluteString == uri, playingID == nil,
               let (pos, _, _) = try? await s.position() else { return r.stop() }
         episode = (id, d); playingID = id; streamURL = hls; resolvedAt = .now
         cast = s; relay = r; duration = r.seconds; paused = !playing; streamError = nil
@@ -877,8 +912,7 @@ enum Keychain {
             info[MPMediaItemPropertyPlaybackDuration] = duration
             info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
         }
-        // NTS's image server crops to a centred square when the path says crop/ instead of resize/
-        let url = (media?.pictureLarge ?? media?.pictureMedium).flatMap { URL(string: $0.replacing(/resize\/\d+x\d+/, with: "crop/500x500")) }
+        let url = media?.cover
         if let url, artwork?.url == url { info[MPMediaItemPropertyArtwork] = artwork?.art }
         else if let url {   // load once per item, then republish
             artwork = (url, nil)
