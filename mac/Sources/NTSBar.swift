@@ -25,6 +25,7 @@ struct Details: Decodable {
     var broadcast: String?, mixcloud: String?, audioSources: [Source]?
     struct Source: Decodable { var url: String? }
     var broadcastDate: Date? { broadcast.flatMap { try? Date($0, strategy: .iso8601) } }
+    var source: String? { audioSources?.first?.url ?? mixcloud }   // what resolve-stream turns into HLS
     /// API path of this episode, e.g. shows/x/episodes/y
     var episodePath: String? { showAlias.flatMap { s in episodeAlias.map { "shows/\(s)/episodes/\($0)" } } }
 }
@@ -215,13 +216,38 @@ struct SonosRoom: Hashable {
         }.sorted { $0.name < $1.name }
     }
 
-    func play(_ url: URL, title: String) async throws {
+    /// A stream as a radio station; a file (an archive episode, via EpisodeRelay) as a track, so it can pause and seek.
+    func play(_ url: URL, title: String, file: Bool = false) async throws {
         func esc(_ s: String) -> String { s.replacing("&", with: "&amp;").replacing("<", with: "&lt;").replacing(">", with: "&gt;").replacing("\"", with: "&quot;") }
         // audioBroadcast + the radio cdudn: the Sonos app shows the title as a station
+        let kind = file ? "<upnp:class>object.item.audioItem.musicTrack</upnp:class>"
+            : #"<upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc>"#
         let didl = #"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="R:0/0/0" parentID="R:0/0" restricted="true"><dc:title>"#
-            + esc(title) + #"</dc:title><upnp:class>object.item.audioItem.audioBroadcast</upnp:class><desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">SA_RINCON65031_</desc></item></DIDL-Lite>"#
-        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(Self.uri(url.absoluteString)))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
-        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>")
+            + esc(title) + "</dc:title>" + kind + "</item></DIDL-Lite>"
+        let uri = file ? url.absoluteString : Self.uri(url.absoluteString)
+        _ = try await Self.soap(host, "MediaRenderer/AVTransport", "SetAVTransportURI", "<InstanceID>0</InstanceID><CurrentURI>\(esc(uri))</CurrentURI><CurrentURIMetaData>\(esc(didl))</CurrentURIMetaData>")
+        try await resume()
+    }
+
+    func resume() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>") }
+    func pause() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Pause", "<InstanceID>0</InstanceID>") }
+
+    /// Retried for a few seconds: a track that's still loading refuses to seek.
+    func seek(_ seconds: Double) async throws {
+        let s = Int(seconds), target = String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60)
+        for attempt in 0..<10 {
+            do { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Seek", "<InstanceID>0</InstanceID><Unit>REL_TIME</Unit><Target>\(target)</Target>"); return }
+            catch { if attempt == 9 { throw error }; try await Task.sleep(for: .milliseconds(500)) }
+        }
+    }
+
+    /// Where the track is and whether it's PLAYING, PAUSED_PLAYBACK, STOPPED or TRANSITIONING.
+    func position() async throws -> (seconds: Double, state: String) {
+        let state = try await Self.soap(host, "MediaRenderer/AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
+            .firstMatch(of: /<CurrentTransportState>([A-Z_]+)/).map { String($0.1) } ?? ""
+        let rel = try await Self.soap(host, "MediaRenderer/AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+            .firstMatch(of: /<RelTime>(\d+):(\d+):(\d+)/).map { Double(Int($0.1)! * 3600 + Int($0.2)! * 60 + Int($0.3)!) } ?? 0
+        return (rel, state)
     }
 
     /// How Sonos names a stream we gave it; it keeps this as CurrentURI while following the geo redirects itself.
@@ -261,6 +287,112 @@ struct SonosRoom: Hashable {
         let (data, resp) = try await URLSession.shared.data(for: r)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw APIError(errorDescription: "Sonos \(action) failed") }
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+/// Serves an archive episode to a Sonos room as one plain MP3, on this Mac's LAN address, only while it plays there.
+/// SoundCloud's HLS segments are byte ranges of a single MP3 whose signature covers any range, so each request
+/// (Sonos seeks with Range) is fetched as pieces small enough for SoundCloud (≤150 KB, it refuses ~200 KB),
+/// one at a time as the speaker reads: about 16 KB/s and one piece in memory.
+@MainActor final class EpisodeRelay {
+    private(set) var url: URL?   // what the speaker fetches, once started
+    private(set) var seconds: Double = 0
+    private var template = "", size = 0
+    private let playlist: URL, refresh: () async throws -> URL
+    private var listener: NWListener?
+    private var awake: NSObjectProtocol?
+    private static let session = URLSession(configuration: .ephemeral)   // pieces kept out of the app's disk cache
+
+    init(playlist: URL, refresh: @escaping () async throws -> URL) { self.playlist = playlist; self.refresh = refresh }
+
+    /// Reads the playlist and starts listening; throws for a stream that isn't SoundCloud's MP3 ranges (play it on the Mac).
+    func start(for speaker: String) async throws {
+        try await read(playlist)
+        // the address this Mac reaches the speaker from
+        let probe = NWConnection(host: .init(speaker), port: 1400, using: .tcp)
+        defer { probe.cancel() }
+        let ip: String = try await withCheckedThrowingContinuation { c in
+            probe.stateUpdateHandler = { s in
+                switch s {
+                case .ready:
+                    if case .hostPort(let h, _)? = probe.currentPath?.localEndpoint { c.resume(returning: "\(h)") } else { c.resume(throwing: APIError(errorDescription: "No local address")) }
+                    probe.stateUpdateHandler = nil
+                case .failed(let e), .waiting(let e): c.resume(throwing: e); probe.stateUpdateHandler = nil   // waiting: unreachable, it would retry forever
+                default: break
+                }
+            }
+            probe.start(queue: .main)
+        }
+        let l = try NWListener(using: .tcp)
+        listener = l
+        l.newConnectionHandler = { [weak self] c in Task { @MainActor in self?.serve(c) } }
+        let port: UInt16 = try await withCheckedThrowingContinuation { c in
+            l.stateUpdateHandler = { s in
+                switch s {
+                case .ready: c.resume(returning: l.port?.rawValue ?? 0); l.stateUpdateHandler = nil
+                case .failed(let e): c.resume(throwing: e); l.stateUpdateHandler = nil
+                default: break
+                }
+            }
+            l.start(queue: .main)
+        }
+        url = URL(string: "http://\(ip):\(port)/episode.mp3")
+        awake = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Playing an episode on Sonos")   // no idle sleep, no App Nap
+    }
+
+    func stop() {
+        listener?.cancel(); listener = nil
+        if let a = awake { ProcessInfo.processInfo.endActivity(a); awake = nil }
+    }
+
+    private func read(_ playlist: URL) async throws {
+        let text = String(decoding: try await URLSession.shared.data(from: playlist).0, as: UTF8.self)
+        let parts = text.split(separator: "\n").filter { $0.hasPrefix("http") }
+        guard let first = parts.first, first.contains(/\/media\/\d+\/\d+\/\d+\//),
+              let end = parts.last?.firstMatch(of: /\/media\/\d+\/\d+\/(\d+)\//).flatMap({ Int($0.1) })
+        else { throw APIError(errorDescription: "Not an MP3 playlist") }
+        template = String(first); size = end + 1
+        seconds = text.matches(of: /#EXTINF:([\d.]+)/).compactMap { Double($0.1) }.reduce(0, +)
+    }
+
+    private func piece(_ from: Int, _ to: Int, retry: Bool = true) async throws -> Data {
+        let u = URL(string: template.replacing(/\/media\/(\d+)\/\d+\/\d+\//) { "/media/\($0.1)/\(from)/\(to)/" })!
+        let (data, resp) = try await Self.session.data(from: u)
+        if (resp as? HTTPURLResponse)?.statusCode == 200 { return data }
+        guard retry else { throw APIError(errorDescription: "Episode piece refused") }
+        try await read(try await refresh())   // signatures last an hour or so: a long pause outlives them
+        return try await piece(from, to, retry: false)
+    }
+
+    private func serve(_ c: NWConnection) {
+        c.start(queue: .main)
+        c.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, _, _ in
+            let head = data.map { String(decoding: $0, as: UTF8.self) } ?? ""
+            Task { @MainActor in await self?.respond(c, head); c.cancel() }
+        }
+    }
+
+    private func respond(_ c: NWConnection, _ head: String) async {
+        func send(_ d: Data) async throws {
+            try await withCheckedThrowingContinuation { (k: CheckedContinuation<Void, Error>) in
+                c.send(content: d, completion: .contentProcessed { e in if let e { k.resume(throwing: e) } else { k.resume() } })
+            }
+        }
+        let range = head.firstMatch(of: /(?im)^range:\s*bytes=(\d+)-(\d*)/)
+        let from = range.flatMap { Int($0.1) } ?? 0, to = min(range.flatMap { Int($0.2) } ?? size - 1, size - 1)
+        guard from <= to else { try? await send(Data("HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */\(size)\r\nConnection: close\r\n\r\n".utf8)); return }
+        var h = (range == nil ? "HTTP/1.1 200 OK" : "HTTP/1.1 206 Partial Content") + "\r\nContent-Type: audio/mpeg\r\nAccept-Ranges: bytes\r\nContent-Length: \(to - from + 1)\r\nConnection: close\r\n"
+        if range != nil { h += "Content-Range: bytes \(from)-\(to)/\(size)\r\n" }
+        do {
+            try await send(Data((h + "\r\n").utf8))
+            guard !head.hasPrefix("HEAD") else { return }
+            var at = from
+            while at <= to, listener != nil {   // a send fails once the speaker hangs up (it seeked or stopped)
+                let end = min(at + 150_000 - 1, to)
+                try await send(try await piece(at, end))
+                at = end + 1
+            }
+        } catch {}
     }
 }
 
@@ -309,7 +441,10 @@ enum Keychain {
     var loading: Bool { resolving || buffering }
     var pendingID: String?   // episode tapped but not yet audible, for its spinner
     func waiting(_ id: String) -> Bool { pendingID == id || (playingID == id && buffering) }
-    var position: Double { seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0) }
+    var position: Double {
+        if let c = castClock { return min(c.pos + (paused ? 0 : -c.at.timeIntervalSinceNow), duration > 0 ? duration : .infinity) }
+        return seekTarget ?? (player.currentTime().seconds.isFinite ? player.currentTime().seconds : 0)
+    }
     var seekTarget: Double?   // held while a seek is in flight, so the tracklist highlight jumps straight there
     var duration: Double = 0   // stored, not read off the player: views must see it arrive (the mini player's seek bar)
 
@@ -393,6 +528,9 @@ enum Keychain {
     var speaker: SonosRoom? { didSet { UserDefaults.standard.set(speaker?.name, forKey: "speaker") } }   // chosen output for live and mixtapes; nil plays on this Mac
     var cast: SonosRoom?   // the room actually playing our stream now
     var volume: Int?   // the chosen room's, read when it's picked or the rooms are looked up again
+    @ObservationIgnored private var relay: EpisodeRelay?   // set while an archive episode plays on Sonos
+    @ObservationIgnored private var castClock: (pos: Double, at: Date)?   // that episode's position, as of a moment: counted here, corrected by watch
+    @ObservationIgnored private var castCommandAt = Date.distantPast   // our last pause/resume/seek: a reading taken before it is stale
 
     func setVolume(_ v: Int) {
         guard let s = speaker else { return }
@@ -400,24 +538,75 @@ enum Keychain {
         Task { try? await s.setVolume(v) }
     }
 
-    /// Starts the playing item's stream: on the chosen Sonos room for live and mixtapes, else (and for archive episodes) on the Mac.
-    private func load(_ u: URL) {
-        if let c = cast, c != speaker || episode?.id == playingID { stopCast(c) }
-        guard let s = speaker, episode?.id != playingID else { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play(); return }
+    /// Starts the playing item's stream (an archive episode from `start` seconds): on the chosen Sonos room, else on the Mac.
+    /// Live and mixtapes the speaker fetches itself; an episode goes through an EpisodeRelay.
+    private func load(_ u: URL, at start: Double = 0) {
+        if let c = cast, c != speaker { stopCast(c) }
+        dropRelay()   // the same room just takes the new URI, no Stop that could land after it
+        guard let s = speaker else { playHere(u, at: start); return }
         player.pause(); player.replaceCurrentItem(with: nil)   // paused first: a playing player with no item reports waiting, which shows as loading
         cast = s
-        let id = playingID, title = mixtapes.first { $0.id == id }?.title ?? "NTS \(id ?? "")"
+        let id = playingID
+        guard episode?.id == id, let source = episode?.details.source else {
+            let title = mixtapes.first { $0.id == id }?.title ?? "NTS \(id ?? "")"
+            Task { do { try await s.play(u, title: title) } catch { castFailed(s, id) } }
+            return
+        }
+        let r = EpisodeRelay(playlist: u) { try await resolveStream(source) }
+        relay = r; castClock = (start, .now)
         Task {
-            do { try await s.play(u, title: title) } catch {
-                guard cast == s, playingID == id else { return }
-                cast = nil; paused = true; streamError = "Can't reach \(s.name)"; nowPlaying()
+            do { try await r.start(for: s.host) } catch {
+                guard relay === r else { return r.stop() }
+                dropRelay(); cast = nil   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it
+                return playHere(u, at: start)
+            }
+            guard relay === r, let url = r.url else { return r.stop() }
+            duration = r.seconds; nowPlaying()
+            do {
+                try await s.play(url, title: episode?.details.name ?? "NTS", file: true)
+                if start > 0 { try await s.seek(start) }
+                guard relay === r else { return }
+                if paused { try await s.pause() }   // paused while it started
+                castClock = (start, .now); pendingID = nil; nowPlaying()   // counted from when it actually starts
+                watch(r, on: s)
+            } catch { castFailed(s, id) }
+        }
+    }
+
+    private func playHere(_ u: URL, at start: Double) {
+        player.replaceCurrentItem(with: AVPlayerItem(url: u))
+        if start > 0 { player.seek(to: CMTime(seconds: start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
+        player.play()
+    }
+
+    private func castFailed(_ s: SonosRoom, _ id: String?) {
+        guard cast == s, playingID == id else { return }
+        listenStop(); dropRelay()
+        cast = nil; paused = true; pendingID = nil; streamError = "Can't reach \(s.name)"; nowPlaying()
+    }
+
+    private func dropRelay() { relay?.stop(); relay = nil; castClock = nil }
+
+    /// Every 5s while an episode plays on Sonos: corrects the position, and follows a pause, play or stop made in the Sonos app or on the speaker.
+    private func watch(_ r: EpisodeRelay, on s: SonosRoom) {
+        Task {
+            while relay === r {
+                try? await Task.sleep(for: .seconds(5))
+                let asked = Date.now
+                guard let (pos, state) = try? await s.position(), relay === r, castCommandAt < asked else { continue }
+                switch state {
+                case "PLAYING": castClock = (pos, .now); if paused { paused = false; listenStart(); nowPlaying() }
+                case "PAUSED_PLAYBACK": if !paused { castClock = (pos, .now); listenStop(); paused = true; nowPlaying() }
+                case "STOPPED": ended()   // reached the end, or stopped from the Sonos app
+                default: break
+                }
             }
         }
     }
 
     private func stopCast(_ c: SonosRoom? = nil) {
         guard let c = c ?? cast else { return }
-        if cast == c { cast = nil }
+        if cast == c { cast = nil; dropRelay() }
         Task { try? await c.stop() }
     }
 
@@ -437,13 +626,13 @@ enum Keychain {
         nowPlaying()
     }
 
-    /// Moves a playing live stream or mixtape to the new output straight away.
+    /// Moves whatever's playing to the new output straight away, an episode at the same spot. A paused one moves when resumed.
     func setSpeaker(_ s: SonosRoom?) {
         guard s != speaker else { return }
         speaker = s
         volume = nil
         if let s { Task { if let v = try? await s.volume(), speaker == s { volume = v } } }
-        if playingID != nil, !paused, episode?.id != playingID, let u = streamURL { load(u) }
+        if playingID != nil, !paused, let u = streamURL { load(u, at: episode?.id == playingID ? position : 0) }
     }
 
     @ObservationIgnored private var statusObserver: NSKeyValueObservation?
@@ -504,13 +693,21 @@ enum Keychain {
     }
 
     /// Archive episodes resume where they paused; live streams and mixtapes reload at the live edge.
+    /// An episode on Sonos pauses there; one whose output changed while paused resumes on the new one, at the same spot.
     func pauseResume() {
         defer { nowPlaying() }
-        if !paused { listenStop(); player.pause(); stopCast() }
-        else if episode?.id == playingID && streamError == nil { player.play(); paused = false; listenStart(); return }   // ponytail: a failed episode retries from the start, seek back if that annoys
-        else if let u = streamURL { load(u) }
+        let archive = episode?.id == playingID
+        if !paused {
+            listenStop()
+            if relay != nil, let c = cast { castCommandAt = .now; castClock = (position, .now); paused = true; Task { try? await c.pause() }; return }
+            player.pause(); stopCast()
+        } else if archive, streamError == nil, relay != nil ? cast == speaker : speaker == nil && player.currentItem != nil {
+            if relay != nil, let c = cast { castCommandAt = .now; castClock = (position, .now); Task { try? await c.resume() } } else { player.play() }
+            paused = false; listenStart(); return
+        } else if let u = streamURL { load(u, at: archive && streamError == nil ? position : 0) }   // ponytail: a failed episode retries from the start, seek back if that annoys
         paused.toggle()
         streamError = nil
+        if archive, !paused { listenStart() }
     }
 
     /// Archive episodes play in-app: tapping the playing one pauses or resumes it.
@@ -520,7 +717,7 @@ enum Keychain {
         defer { resolving = false }   // pendingID clears once audio actually plays (observeStatus), so the spinner doesn't blink at the hand-off
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
-            guard let source = d.audioSources?.first?.url ?? d.mixcloud else { throw APIError(errorDescription: "No audio for this episode") }
+            guard let source = d.source else { throw APIError(errorDescription: "No audio for this episode") }
             let hls = try await resolveStream(source)
             episode = (id, d)
             toggle(id, hls.absoluteString)
@@ -546,6 +743,7 @@ enum Keychain {
     func skip(_ seconds: Double) { seek(to: position + seconds) }
     func seek(to seconds: Double) {
         let s = min(max(0, seconds), duration)
+        if relay != nil, let c = cast { castCommandAt = .now; castClock = (s, .now); Task { try? await c.seek(s) }; return nowPlaying() }
         seekTarget = s
         // exact: the default tolerance lands on the segment before, i.e. the end of the previous track
         Task { await player.seek(to: CMTime(seconds: s, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero); seekTarget = nil; nowPlaying() }
@@ -556,6 +754,7 @@ enum Keychain {
     /// Seeks to the dragged spot, holding the handle there until the seek lands.
     func endScrub() {
         guard let f = scrub else { return }
+        if relay != nil { seek(to: f * duration); scrub = nil; return }
         Task { await player.seek(to: CMTime(seconds: f * duration, preferredTimescale: 600)); scrub = nil; nowPlaying() }
     }
 
@@ -815,6 +1014,7 @@ enum Keychain {
         guard episode?.id == playingID, !paused else { return }
         listenStop()
         paused = true
+        if castClock != nil { castClock = (0, .now) }   // on Sonos, play starts the stopped track over
         player.seek(to: .zero)
         nowPlaying()
     }
@@ -2164,19 +2364,17 @@ struct MiniPlayer: View {
 struct SpeakerButton: View {
     @Environment(Store.self) var store
     @State private var open = false
-    /// An archive episode is playing: Sonos can't fetch its HLS, so only this Mac and AirPlay (Sonos rooms included) can play it.
-    var episodeOnMac: Bool { store.playingID != nil && store.episode?.id == store.playingID }
 
     var body: some View {
         Button { open.toggle() } label: {
             Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14)).contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .help(store.cast.map { "Playing on \($0.name)" } ?? (episodeOnMac ? "This Mac or AirPlay" : "Sonos or AirPlay"))
+        .help(store.cast.map { "Playing on \($0.name)" } ?? "Sonos or AirPlay")
         .popover(isPresented: $open, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 2) {
                 row("This Mac", nil)
-                if !episodeOnMac { ForEach(store.rooms, id: \.self) { row($0.name, $0) } }
+                ForEach(store.rooms, id: \.self) { row($0.name, $0) }
                 HStack {
                     Text("AirPlay".nts).font(.nts(13))
                     Spacer()
@@ -2184,7 +2382,7 @@ struct SpeakerButton: View {
                 }
                 .padding(.horizontal, 8).frame(height: 26)
                 .overlay { AirPlayPicker(player: store.player) { store.setSpeaker(nil) } }
-                if store.speaker != nil, !episodeOnMac {   // the room's volume does nothing for an episode
+                if store.speaker != nil {
                     HStack(spacing: 8) {
                         Image(systemName: "speaker.fill").font(.system(size: 11)).opacity(0.6)
                         // sent once the drag ends: one request per tick could land out of order
@@ -2206,7 +2404,7 @@ struct SpeakerButton: View {
             HStack {
                 Text(name.nts).font(.nts(13)).lineLimit(1)
                 Spacer()
-                if episodeOnMac ? room == nil : store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
+                if store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
             }
             .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
         }
