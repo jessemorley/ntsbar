@@ -1087,9 +1087,13 @@ struct Push<Base: View, Top: View>: View {
     @ViewBuilder var base: Base
     @ViewBuilder var top: Top
     var body: some View {
+        // base stays alive underneath, so back returns to its scroll position (and its images stay loaded)
         ZStack(alignment: .top) {
+            base
+                .offset(x: shown ? -120 : 0)
+                .allowsHitTesting(!shown)
+                .transformPreference(ScrolledDown.self) { if shown { $0 = false } }   // only the page in front drives the tab bar
             if shown { top.background(.black).transition(.move(edge: .trailing)).zIndex(1) }
-            else { base.transition(.offset(x: -120)) }
         }
     }
 }
