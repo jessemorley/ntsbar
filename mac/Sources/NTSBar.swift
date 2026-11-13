@@ -1101,15 +1101,21 @@ struct RootView: View {
 /// Change `shown` inside `push { }`.
 struct Push<Base: View, Top: View>: View {
     let shown: Bool
+    /// Base stays alive underneath, so back returns to its scroll position (and its images stay loaded).
+    /// Off where the window fits its content (Now Playing): a kept base would hold the window at its height.
+    var keep = true
     @ViewBuilder var base: Base
     @ViewBuilder var top: Top
     var body: some View {
-        // base stays alive underneath, so back returns to its scroll position (and its images stay loaded)
         ZStack(alignment: .top) {
-            base
-                .offset(x: shown ? -120 : 0)
-                .allowsHitTesting(!shown)
-                .transformPreference(ScrolledDown.self) { if shown { $0 = false } }   // only the page in front drives the tab bar
+            if keep {
+                base
+                    .offset(x: shown ? -120 : 0)
+                    .allowsHitTesting(!shown)
+                    .transformPreference(ScrolledDown.self) { if shown { $0 = false } }   // only the page in front drives the tab bar
+            } else if !shown {
+                base.transition(.offset(x: -120))
+            }
             if shown { top.background(.black).transition(.move(edge: .trailing)).zIndex(1) }
         }
     }
@@ -1934,8 +1940,8 @@ struct MiniPlayer: View {
                         Text(err).font(.system(size: 11)).foregroundStyle(.red).lineLimit(1).help(err)
                     } else if let track {
                         Button {   // straight to the tracklist
-                            store.showTracklist = true
-                            if !expanded { open() }
+                            // on Now Playing already: slide the tracklist in; from elsewhere the page opens straight onto it
+                            if expanded { push { store.showTracklist = true } } else { store.showTracklist = true; open() }
                         } label: {
                             Text(track.nts).font(.nts(11, .regular)).opacity(0.8).lineLimit(1)
                         }
@@ -2090,9 +2096,7 @@ struct EpisodeNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             let pos = store.position, dur = store.duration
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= pos }
-            if store.showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { store.showTracklist = false }
-            } else {
+            Push(shown: store.showTracklist && tracks != nil, keep: false) {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let date = d.broadcastDate ?? .now
@@ -2110,9 +2114,13 @@ struct EpisodeNowView: View {
                             Text("-" + clock(dur - at)).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { push { store.showTracklist = true } }
                         Spacer(minLength: 12)
                     }
+                }
+            } top: {
+                if let tracks {
+                    TracklistView(tracks: tracks, current: current, episode: path, seek: store.seekable ? { store.seek(to: $0) } : nil) { push { store.showTracklist = false } }
                 }
             }
         }
@@ -2130,9 +2138,7 @@ struct ChannelNowView: View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let elapsed = ctx.date.timeIntervalSince(b.startTimestamp)
             let current = tracks?.lastIndex { Double($0.offset ?? .max) <= elapsed }
-            if store.showTracklist, let tracks {
-                TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { store.showTracklist = false }
-            } else {
+            Push(shown: store.showTracklist && tracks != nil, keep: false) {
                 FitScroll {
                     VStack(alignment: .leading, spacing: 0) {
                         let end = b.endTimestamp ?? ctx.date
@@ -2152,7 +2158,7 @@ struct ChannelNowView: View {
                             Text("\(max(0, Int(end.timeIntervalSince(ctx.date) / 60))) MIN LEFT".nts).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
-                        EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
+                        EpisodeInfo(details: d, tracks: tracks) { push { store.showTracklist = true } }
 
                         if let next = channel.next {
                             Rule().padding(.horizontal, pageInset).padding(.top, 18)
@@ -2166,6 +2172,10 @@ struct ChannelNowView: View {
 
                         Spacer(minLength: 20)
                     }
+                }
+            } top: {
+                if let tracks {
+                    TracklistView(tracks: tracks, current: current, episode: d?.episodePath) { push { store.showTracklist = false } }
                 }
             }
         }
