@@ -253,12 +253,13 @@ struct SonosRoom: Hashable {
     /// How Sonos names a stream we gave it; it keeps this as CurrentURI while following the geo redirects itself.
     static func uri(_ url: String) -> String { "x-rincon-mp3radio://" + url.replacing(/^https?:\/\//, with: "") }
 
-    /// The stream the room is playing (or starting), nil when stopped or paused.
-    func playingURI() async throws -> String? {
+    /// What the room is playing (or starting) or has paused, nil when stopped.
+    func currentURI() async throws -> (uri: String, playing: Bool)? {
         let state = try await Self.soap(host, "MediaRenderer/AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
-        guard state.contains("<CurrentTransportState>PLAYING") || state.contains("<CurrentTransportState>TRANSITIONING") else { return nil }
+        let playing = state.contains("<CurrentTransportState>PLAYING") || state.contains("<CurrentTransportState>TRANSITIONING")
+        guard playing || state.contains("<CurrentTransportState>PAUSED_PLAYBACK") else { return nil }
         let media = try await Self.soap(host, "MediaRenderer/AVTransport", "GetMediaInfo", "<InstanceID>0</InstanceID>")
-        return media.firstMatch(of: /<CurrentURI>([^<]*)/).map { String($0.1).replacing("&amp;", with: "&") }
+        return media.firstMatch(of: /<CurrentURI>([^<]*)/).map { (String($0.1).replacing("&amp;", with: "&"), playing) }
     }
 
     func stop() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Stop", "<InstanceID>0</InstanceID>") }
@@ -306,7 +307,9 @@ struct SonosRoom: Hashable {
     init(playlist: URL, refresh: @escaping () async throws -> URL) { self.playlist = playlist; self.refresh = refresh }
 
     /// Reads the playlist and starts listening; throws for a stream that isn't SoundCloud's MP3 ranges (play it on the Mac).
-    func start(for speaker: String) async throws {
+    /// `path` (the episode's id) goes in the URL so a relaunched app can tell what the room is playing,
+    /// and `port` takes back the one in that URL, so the room carries on reading from the new relay.
+    func start(for speaker: String, path: String, port wanted: UInt16? = nil) async throws {
         try await read(playlist)
         // the address this Mac reaches the speaker from
         let probe = NWConnection(host: .init(speaker), port: 1400, using: .tcp)
@@ -323,7 +326,9 @@ struct SonosRoom: Hashable {
             }
             probe.start(queue: .main)
         }
-        let l = try NWListener(using: .tcp)
+        let tcp = NWParameters.tcp
+        tcp.allowLocalEndpointReuse = true   // the last run's connections may still hold the port
+        let l = try wanted.flatMap(NWEndpoint.Port.init(rawValue:)).map { try NWListener(using: tcp, on: $0) } ?? NWListener(using: tcp)
         listener = l
         l.newConnectionHandler = { [weak self] c in Task { @MainActor in self?.serve(c) } }
         let port: UInt16 = try await withCheckedThrowingContinuation { c in
@@ -336,7 +341,7 @@ struct SonosRoom: Hashable {
             }
             l.start(queue: .main)
         }
-        url = URL(string: "http://\(ip):\(port)/episode.mp3")
+        url = URL(string: "http://\(ip):\(port)\(path).mp3")
         awake = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Playing an episode on Sonos")   // no idle sleep, no App Nap
     }
 
@@ -572,7 +577,7 @@ enum Keychain {
         let r = EpisodeRelay(playlist: u) { try await resolveStream(source) }
         relay = r; castClock = (start, .now)
         Task {
-            do { try await r.start(for: s.host) } catch {
+            do { try await r.start(for: s.host, path: id ?? "/episode") } catch {
                 guard relay === r else { return r.stop() }
                 dropRelay(); cast = nil   // not SoundCloud's MP3 ranges (Mixcloud): the Mac plays it
                 return playHere(u, at: start)
@@ -638,10 +643,30 @@ enum Keychain {
         if let r = rooms.first(where: { $0.name == name }), r != speaker { setSpeaker(r) }
         if let s = speaker, let v = try? await s.volume(), speaker == s { volume = v }   // the Sonos app or buttons may have moved it
         // The room still playing an NTS stream (from before a relaunch, or picked in the Sonos app): shown here so pause and stop work
-        guard playingID == nil, let s = speaker, let uri = try? await s.playingURI(), playingID == nil,
-              let (id, url) = (liveStreams.map { ($0.key, $0.value) } + mixtapes.map { ($0.id, $0.audioStreamEndpoint) })
+        guard playingID == nil, let s = speaker, let (uri, playing) = try? await s.currentURI(), playingID == nil else { return }
+        if let m = uri.wholeMatch(of: /http:\/\/[\d.]+:(\d+)(\/shows\/.+)\.mp3/), let port = UInt16(m.1) {
+            return await adoptEpisode(String(m.2), uri: uri, port: port, on: s, playing: playing)
+        }
+        guard playing, let (id, url) = (liveStreams.map { ($0.key, $0.value) } + mixtapes.map { ($0.id, $0.audioStreamEndpoint) })
                 .first(where: { SonosRoom.uri($0.1) == uri }) else { return }
         playingID = id; streamURL = URL(string: url); cast = s; paused = false; streamError = nil
+        nowPlaying()
+    }
+
+    /// An episode the last run of the app was relaying (playing or paused): the relay comes back on the same address,
+    /// so the room keeps reading, and the episode shows as playing there.
+    private func adoptEpisode(_ id: String, uri: String, port: UInt16, on s: SonosRoom, playing: Bool) async {
+        guard let d: Details = try? await fetchOne(String(id.dropFirst())), let source = d.source,
+              let hls = try? await resolveStream(source), playingID == nil else { return }
+        let r = EpisodeRelay(playlist: hls) { try await resolveStream(source) }
+        // another Mac's relay, or the port's taken: not ours to pick up
+        guard (try? await r.start(for: s.host, path: id, port: port)) != nil, r.url?.absoluteString == uri, playingID == nil,
+              let (pos, _) = try? await s.position() else { return r.stop() }
+        episode = (id, d); playingID = id; streamURL = hls; resolvedAt = .now
+        cast = s; relay = r; duration = r.seconds; paused = !playing; streamError = nil
+        castClock = (pos, .now)
+        if playing { listenStart() }
+        watch(r, on: s)
         nowPlaying()
     }
 
