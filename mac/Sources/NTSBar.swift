@@ -235,6 +235,9 @@ enum Keychain {
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
     var schedules: [String: [Broadcast]] = [:]   // by channel: this week and next (/radio/schedule)
     @ObservationIgnored private var schedulesAt = Date.distantPast
+    var images: [URL: NSImage] = [:]   // show artwork prefetched on hover; Cover draws these at once
+    var showEpisodes: [String: [Details]] = [:]   // a show's first page of episodes (raw), prefetched on hover
+    @ObservationIgnored private var prefetching: Set<String> = []
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
 
@@ -554,6 +557,27 @@ enum Keychain {
         }
     }
 
+    /// Hovering a row that opens a show: its details, banner, first page of episodes and the first few episodes' artwork,
+    /// so the push slides in with them drawn. Fetched side by side; whatever fails the show page loads itself.
+    func prefetchShow(_ id: String) {
+        guard prefetching.insert(id).inserted else { return }
+        Task {
+            if details[id] == nil { details[id] = try? await fetchOne(String(id.dropFirst())) }
+            cacheImages([details[id]?.media?.wide])
+        }
+        Task {
+            if showEpisodes[id] == nil { showEpisodes[id] = try? await fetchEpisodes(id, offset: 0) }
+            cacheImages((showEpisodes[id] ?? []).prefix(3).map(\.media?.wide))   // what fits below the banner
+        }
+    }
+
+    private func cacheImages(_ urls: [URL?]) {
+        if images.count > 60 { images.removeAll() }   // ponytail: crude cap on decoded bitmaps; an LRU if hover-browsing many shows matters
+        for case let u? in urls where images[u] == nil {
+            Task { if let (d, _) = try? await URLSession.shared.data(from: u), let img = NSImage(data: d) { images[u] = img } }
+        }
+    }
+
     /// Both channels' schedules, refetched once over 15 min old (the API's max-age); a failure retries next call.
     func loadSchedules() async {
         guard schedulesAt < .now - 900 else { return }
@@ -813,11 +837,23 @@ struct Rule: View {
 
 /// Image that fills a fixed frame without pushing the layout wider.
 struct Cover: View {
+    @Environment(Store.self) var store
     let url: URL?
     var body: some View {
         Color(white: 0.12)
             // .clipped() hides the fill's overflow but it still takes clicks (e.g. a card's image over the play button above it)
-            .overlay { AsyncImage(url: url) { $0.resizable().scaledToFill() } placeholder: { Color.clear }.allowsHitTesting(false) }
+            .overlay {
+                Group {
+                    if let img = url.flatMap({ store.images[$0] }) { Image(nsImage: img).resizable().scaledToFill() }   // prefetched: no async gap
+                    else {
+                        AsyncImage(url: url) { phase in
+                            if let img = phase.image { img.resizable().scaledToFill() }
+                            else if url != nil && phase.error == nil { Shimmer().opacity(0.08) }   // loading; failed or no artwork stays plain grey
+                        }
+                    }
+                }
+                .allowsHitTesting(false)
+            }
             .clipped()
     }
 }
@@ -1044,6 +1080,22 @@ struct RootView: View {
 
 // MARK: - Live
 
+/// Parallax push: `top` slides in from the right edge over `base`, which drifts a third as far left; back reverses it.
+/// Change `shown` inside `push { }`.
+struct Push<Base: View, Top: View>: View {
+    let shown: Bool
+    @ViewBuilder var base: Base
+    @ViewBuilder var top: Top
+    var body: some View {
+        ZStack(alignment: .top) {
+            if shown { top.background(.black).transition(.move(edge: .trailing)).zIndex(1) }
+            else { base.transition(.offset(x: -120)) }
+        }
+    }
+}
+
+func push(_ change: () -> Void) { withAnimation(.easeOut(duration: 0.2), change) }
+
 struct LiveView: View {
     @Environment(Store.self) var store
     // a channel's schedule, in place of the cards; `--snapshot out.png --schedule 2` opens one
@@ -1052,23 +1104,17 @@ struct LiveView: View {
     }
 
     var body: some View {
-        // parallax push: the schedule slides in from the right edge over the cards, which drift a third as far left
-        ZStack(alignment: .top) {
+        Push(shown: schedule != nil) { cards } top: {
             if let ch = schedule {
                 ScheduleView(tab: ch) { open(nil) }
-                    .background(.black)
                     // Live keeps its tab bar: no inset under it, no hiding on scroll
                     .environment(\.tabBar, TabBarInset())
                     .transformPreference(ScrolledDown.self) { $0 = false }
-                    .transition(.move(edge: .trailing))
-                    .zIndex(1)
-            } else {
-                cards.transition(.offset(x: -120))
             }
         }
     }
 
-    func open(_ ch: String?) { withAnimation(.easeOut(duration: 0.3)) { schedule = ch } }
+    func open(_ ch: String?) { push { schedule = ch } }
 
     var cards: some View {
         VStack(spacing: 0) {
@@ -1096,7 +1142,7 @@ struct ScheduleView: View {
     var following: Bool { tab == "following" }
 
     var body: some View {
-        if let s = show { ShowView(show: s) { show = nil } } else { list }
+        Push(shown: show != nil) { list } top: { if let s = show { ShowView(show: s) { push { show = nil } } } }
     }
 
     var list: some View {
@@ -1183,7 +1229,7 @@ struct ScheduleView: View {
         let live = store.live.first { $0.id == s.channel }?.now
         let desc = onNow && live?.startTimestamp == b.startTimestamp ? live?.embeds?.details?.description : nil
         return Button {
-            if let p = b.showPath { show = Saved(id: p, title: b.bareTitle, subtitle: "") }
+            if let p = b.showPath { push { show = Saved(id: p, title: b.bareTitle, subtitle: "") } }
         } label: {
             HStack(alignment: .firstTextBaseline, spacing: 0) {
                 Text(hours(b.startTimestamp, end).nts).font(.nts(13, onNow ? .bold : .regular))
@@ -1205,6 +1251,7 @@ struct ScheduleView: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .onHover { if $0, let p = b.showPath { store.prefetchShow(p) } }
     }
 }
 
@@ -1452,27 +1499,15 @@ struct SavedView: View {
     }
 
     var body: some View {
-        if let s = show { ShowView(show: s) { show = nil } } else { lists }
+        Push(shown: show != nil) { lists } top: { if let s = show { ShowView(show: s) { push { show = nil } } } }
     }
 
     @Environment(\.tabBar) var tabBar
     @State private var headerHeight: CGFloat = 48
     /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
-        HStack(spacing: 6) {
-            // round pills, so they read as the page's filter, not a second tab bar (square boxes are the genre tags'); selected filled white
-            ForEach(SavedTab.allCases, id: \.self) { t in
-                Button { tab = t } label: {
-                    Text(t.rawValue.nts).font(.nts(11))
-                        .foregroundStyle(tab == t ? .black : .white)
-                        .padding(.horizontal, 11).padding(.vertical, 5)
-                        .background(tab == t ? .white : .clear, in: .capsule)
-                        .overlay { Capsule().strokeBorder(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
-                        .contentShape(.capsule)
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer(minLength: 0)
+        // as the schedule's header: icon left, plain tabs right (selected full white, the rest dimmed)
+        HStack(spacing: 16) {
             Menu {
                 if let e = store.email {
                     Text(e)
@@ -1481,11 +1516,16 @@ struct SavedView: View {
                 }
                 Button("Quit") { Task { await store.listenStop()?.value; NSApp.terminate(nil) } }
             } label: {
-                Image(systemName: "ellipsis.circle")   // a menu (account, Quit); a person would echo the MY NTS tab above
+                Image(systemName: "person.circle")   // a menu: account, Quit
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
+            Spacer(minLength: 0)
+            ForEach(SavedTab.allCases, id: \.self) { t in
+                Button { tab = t } label: { Text(t.rawValue.nts).font(.nts(13)).frame(height: 28).contentShape(.rect) }
+                    .buttonStyle(.plain).opacity(tab == t ? 1 : 0.45)
+            }
         }
-        .padding(.horizontal, pageInset).padding(.vertical, 10)
+        .padding(.horizontal, pageInset).padding(.vertical, 8)
         .fixedSize(horizontal: false, vertical: true)
         .measureHeight($headerHeight)
         .background(.black)
@@ -1503,7 +1543,8 @@ struct SavedView: View {
                     empty(tab == .history ? "NOTHING PLAYED YET" : "NOTHING SAVED YET")
                 }
                 ForEach(items) { s in
-                    SavedRow(s: s) { show = s }   // episodes play in-app; hosts open their episode list
+                    SavedRow(s: s) { push { show = s } }
+                        .onHover { if $0 && !s.isEpisode { store.prefetchShow(s.id) } }   // episodes play in-app; hosts open their episode list
                         .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
                     Rule().padding(.horizontal, pageInset)
                 }
@@ -1657,7 +1698,8 @@ struct ShowView: View {
     @State private var episodes: [Details] = []
     @State private var done = false
     @State private var loading = false
-    @State private var info: Details?   // the show itself: banner, location, frequency, description
+    /// The show itself (banner, location, frequency, description): prefetched on hover when it can be, so the push slides in drawn.
+    var info: Details? { store.details[show.id] }
     @State private var bar = 0   // back bar: 0 hidden, 1 shown, 2 with the show name
     @Environment(\.tabBar) var tabBar
 
@@ -1687,13 +1729,17 @@ struct ShowView: View {
                     }
                     Rule().padding(.horizontal, pageInset).padding(.top, 18)
                     SectionLabel(text: "Episodes", dim: false).padding(.top, -6)
-                    ForEach(episodes, id: \.episodeAlias) { d in
+                    // the prefetched page until loadMore takes it, so the first frame of the push already has rows
+                    let list = episodes.isEmpty ? (store.showEpisodes[show.id] ?? []).filter { $0.episodePath != nil } : episodes
+                    ForEach(list, id: \.episodeAlias) { d in
                         let id = "/" + (d.episodePath ?? "")
                         EpisodeRow(id: id, d: d)
                             .onAppear { if d.episodeAlias == episodes.last?.episodeAlias { Task { await loadMore() } } }
                         Rule().padding(.horizontal, pageInset)
                     }
-                    if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                    if list.isEmpty && !done {
+                        ForEach(0..<2, id: \.self) { _ in SkeletonRow(); Rule().padding(.horizontal, pageInset) }
+                    } else if loading { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                 }
             }
             .overlay(alignment: .top) {
@@ -1722,7 +1768,7 @@ struct ShowView: View {
                 return y > bannerHeight + 18 ? 2 : y > bannerHeight - 2 ? 1 : 0
             } action: { bar = $1 }
             .modifier(HidesTabs())
-            .task { info = try? await fetchOne(String(show.id.dropFirst())) }
+            .task { if let d: Details = try? await fetchOne(String(show.id.dropFirst())) { store.details[show.id] = d } }   // refreshes the prefetched copy
             .task { await loadMore() }
         }
     }
@@ -1730,13 +1776,34 @@ struct ShowView: View {
     func loadMore() async {
         guard !loading, !done else { return }
         loading = true; defer { loading = false }
-        let limit = 12
         do {
-            let page: [Details] = try await fetchOne(String(show.id.dropFirst()) + "/episodes", as: Results<Details>.self,
-                query: [.init(name: "offset", value: String(episodes.count)), .init(name: "limit", value: String(limit))]).results
+            var page = episodes.isEmpty ? store.showEpisodes[show.id] ?? [] : []   // the hover-prefetched first page
+            if page.isEmpty { page = try await fetchEpisodes(show.id, offset: episodes.count) }
             episodes += page.filter { $0.episodePath != nil }
-            done = page.count < limit
-        } catch { store.report(error) }
+            done = page.count < episodePage
+        } catch { store.report(error); if episodes.isEmpty { done = true } }   // no skeleton rows left shimmering
+    }
+}
+
+let episodePage = 12
+/// One page of a show's (/shows/x) episodes, unfiltered: a short page means it was the last.
+func fetchEpisodes(_ show: String, offset: Int) async throws -> [Details] {
+    try await fetchOne(String(show.dropFirst()) + "/episodes", as: Results<Details>.self,
+                       query: [.init(name: "offset", value: String(offset)), .init(name: "limit", value: String(episodePage))]).results
+}
+
+/// Stand-in for an EpisodeRow while a show's first episodes load.
+struct SkeletonRow: View {
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Color(white: 0.12).frame(width: 148, height: 93).overlay { Shimmer().opacity(0.08) }.clipped()
+            VStack(alignment: .leading, spacing: 8) {
+                Color(white: 0.12).frame(width: 130, height: 13)
+                Color(white: 0.12).frame(width: 70, height: 9)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, pageInset).padding(.vertical, 10)
     }
 }
 
