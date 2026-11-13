@@ -1342,7 +1342,15 @@ struct ChannelCard: View {
     let channel: Channel
     let openSchedule: () -> Void
 
+    /// A new show crossfades in over the old one (title, time and artwork together), rather than swapping on the poll.
     var body: some View {
+        let key = "\(channel.now.startTimestamp)\(channel.now.broadcastTitle)"
+        ZStack { card.id(key).transition(.opacity) }
+            .animation(.easeInOut(duration: 0.6), value: key)
+            .frame(minHeight: 0, maxHeight: cardHeight)   // shrinks to make room for the mini player
+    }
+
+    @ViewBuilder var card: some View {
         let d = channel.now.embeds?.details
         let playing = store.playingID == channel.id && !store.paused
         ZStack(alignment: .topLeading) {
@@ -1385,7 +1393,6 @@ struct ChannelCard: View {
             }
             .padding(.leading, 8).padding(.trailing, 10).padding(.top, 7).padding(.bottom, 9)
         }
-        .frame(minHeight: 0, maxHeight: cardHeight)   // shrinks to make room for the mini player
     }
 }
 
