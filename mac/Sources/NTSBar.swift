@@ -852,8 +852,9 @@ struct Cover: View {
                 Group {
                     if let img = url.flatMap({ store.images[$0] }) { Image(nsImage: img).resizable().scaledToFill() }   // prefetched: no async gap
                     else {
-                        AsyncImage(url: url) { phase in
-                            if let img = phase.image { img.resizable().scaledToFill() }
+                        // arrivals fade in over the shimmer rather than popping
+                        AsyncImage(url: url, transaction: Transaction(animation: .easeOut(duration: 0.25))) { phase in
+                            if let img = phase.image { img.resizable().scaledToFill().transition(.opacity) }
                             else if url != nil && phase.error == nil { Shimmer().opacity(0.08) }   // loading; failed or no artwork stays plain grey
                         }
                     }
