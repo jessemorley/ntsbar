@@ -561,7 +561,16 @@ enum Keychain {
 
     /// Hovering a row that opens a show: its details, banner, first page of episodes and the first few episodes' artwork,
     /// so the push slides in with them drawn. Fetched side by side; whatever fails the show page loads itself.
-    func prefetchShow(_ id: String) {
+    func hoverShow(_ id: String, _ inside: Bool) {
+        if inside {
+            hoverTask?.cancel(); hovered = id
+            hoverTask = Task { if (try? await Task.sleep(for: .milliseconds(150))) != nil { prefetchShow(id) } }   // rows passed over fetch nothing
+        } else if hovered == id { hoverTask?.cancel() }
+    }
+    @ObservationIgnored private var hoverTask: Task<Void, Never>?
+    @ObservationIgnored private var hovered: String?
+
+    private func prefetchShow(_ id: String) {
         guard prefetching.insert(id).inserted else { return }
         Task {
             if details[id] == nil { details[id] = try? await fetchOne(String(id.dropFirst())) }
@@ -583,22 +592,33 @@ enum Keychain {
         guard schedulesAt < .now - 900 else { return }
         schedulesAt = .now   // also keeps a second caller from fetching alongside
         do {
-            for ch in liveStreams.keys.sorted() {
-                let days: [ScheduleDay] = try await fetch("radio/schedule/\(ch)")
-                schedules[ch] = days.flatMap(\.broadcasts)
+            try await withThrowingTaskGroup(of: (String, [ScheduleDay]).self) { g in   // channels side by side
+                for ch in liveStreams.keys { g.addTask { (ch, try await fetch("radio/schedule/\(ch)")) } }
+                for try await (ch, days) in g { schedules[ch] = days.flatMap(\.broadcasts) }
             }
-        } catch { schedulesAt = .distantPast }
+        } catch { schedulesAt = .distantPast; self.error = "Can't reach NTS" }   // the live poll clears it and retries
     }
 
-    /// Every followed show's id (/shows/x): the whole hosts feed when signed in, else the local saves.
-    func followedShows() async -> Set<String> {
-        guard email != nil else { return Set(saved.filter { !$0.isEpisode }.map(\.id)) }
+    /// Pages in the whole hosts feed when signed in, so isSaved answers for every followed show.
+    func loadFollowedShows() async {
+        guard email != nil else { return }
         var n = -1
-        while feeds[.hosts]?.done != true, feeds[.hosts]?.items.count != n {   // stops when a page adds nothing (failed, or already loading)
-            n = feeds[.hosts]?.items.count ?? 0
+        while feeds[.hosts]?.done != true {
+            if feeds[.hosts]?.loading == true {   // a page already on its way (launch, My NTS): wait for it
+                guard (try? await Task.sleep(for: .milliseconds(100))) != nil else { return }
+                continue
+            }
+            let count = feeds[.hosts]?.items.count ?? 0
+            if count == n { return }   // the last page added nothing (failed)
+            n = count
             await loadMore(.hosts)
         }
-        return Set(feeds[.hosts]?.items.map(\.id) ?? [])
+    }
+
+    /// The hover-prefetched first page of a show's episodes, handed over once so the next open refetches it fresh.
+    func takePrefetchedEpisodes(_ id: String) -> [Details] {
+        prefetching.remove(id)
+        return showEpisodes.removeValue(forKey: id) ?? []
     }
 
     /// Reads the account state for bookmark icons once per id.
@@ -869,6 +889,7 @@ struct RemoteImage: View {
             if let c = imageCache.object(forKey: url as NSURL) { image = c; return }
             image = nil; failed = false
             let img = await loadImage(url)
+            guard !Task.isCancelled else { return }   // superseded by a newer url; don't blank its image
             withAnimation(.easeOut(duration: 0.25)) { image = img }
             failed = img == nil
         }
@@ -1181,7 +1202,7 @@ struct ScheduleView: View {
     @State var tab: String   // a channel ("1", "2") or "following"
     let back: () -> Void
     struct Slot { var channel: String, b: Broadcast; var id: String { channel + b.startTimestamp.ISO8601Format() } }
-    @State private var followed: Set<String>?   // followed show ids, once loaded
+    @State private var followsLoaded = false
     @State private var show: Saved?
     var following: Bool { tab == "following" }
 
@@ -1204,7 +1225,9 @@ struct ScheduleView: View {
                             dayBar(day.key)
                             ForEach(day.value, id: \.id) { row($0, now) }
                         }
-                        if loaded == nil { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                        if loaded == nil, let e = store.error {
+                            Text(e.uppercased()).font(.nts(14)).opacity(0.6).frame(maxWidth: .infinity).padding(.top, 60)
+                        } else if loaded == nil { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
                         else if slots.isEmpty {
                             Text("NO FOLLOWED SHOWS ON THE SCHEDULE".nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
                         }
@@ -1215,7 +1238,7 @@ struct ScheduleView: View {
             }
         }
         .task { await store.loadSchedules() }   // usually a no-op: fetched at launch, refreshed by the live poll
-        .task(id: following) { if following { followed = await store.followedShows() } }
+        .task(id: following) { if following { await store.loadFollowedShows(); followsLoaded = true } }
     }
 
     /// From the store's cached schedules, so the view slides in already filled; nil until they (and follows) are in.
@@ -1227,8 +1250,8 @@ struct ScheduleView: View {
             all += bs.map { Slot(channel: ch, b: $0) }
         }
         guard following else { return all }
-        guard let ids = followed else { return nil }
-        return all.filter { $0.b.showPath.map(ids.contains) == true }.sorted { $0.b.startTimestamp < $1.b.startTimestamp }
+        guard followsLoaded else { return nil }
+        return all.filter { $0.b.showPath.map(store.isSaved) == true }   // live, so a follow made from a pushed show shows on return.sorted { $0.b.startTimestamp < $1.b.startTimestamp }
     }
 
     var header: some View {
@@ -1295,7 +1318,7 @@ struct ScheduleView: View {
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .onHover { if $0, let p = b.showPath { store.prefetchShow(p) } }
+        .onHover { if let p = b.showPath { store.hoverShow(p, $0) } }
     }
 }
 
@@ -1598,7 +1621,7 @@ struct SavedView: View {
                 }
                 ForEach(items) { s in
                     SavedRow(s: s) { push { show = s } }
-                        .onHover { if $0 && !s.isEpisode { store.prefetchShow(s.id) } }   // episodes play in-app; hosts open their episode list
+                        .onHover { if !s.isEpisode { store.hoverShow(s.id, $0) } }   // episodes play in-app; hosts open their episode list
                         .onAppear { if s.id == items.last?.id { Task { await store.loadMore(tab) } } }
                     Rule().padding(.horizontal, pageInset)
                 }
@@ -1752,6 +1775,7 @@ struct ShowView: View {
     @State private var episodes: [Details] = []
     @State private var done = false
     @State private var loading = false
+    @State private var fetched = 0   // raw items paged in, the API's offset (episodes drops those without a path)
     /// The show itself (banner, location, frequency, description): prefetched on hover when it can be, so the push slides in drawn.
     var info: Details? { store.details[show.id] }
     @State private var bar = 0   // back bar: 0 hidden, 1 shown, 2 with the show name
@@ -1831,8 +1855,9 @@ struct ShowView: View {
         guard !loading, !done else { return }
         loading = true; defer { loading = false }
         do {
-            var page = episodes.isEmpty ? store.showEpisodes[show.id] ?? [] : []   // the hover-prefetched first page
-            if page.isEmpty { page = try await fetchEpisodes(show.id, offset: episodes.count) }
+            var page = episodes.isEmpty ? store.takePrefetchedEpisodes(show.id) : []
+            if page.isEmpty { page = try await fetchEpisodes(show.id, offset: fetched) }
+            fetched += page.count
             episodes += page.filter { $0.episodePath != nil }
             done = page.count < episodePage
         } catch { store.report(error); if episodes.isEmpty { done = true } }   // no skeleton rows left shimmering
