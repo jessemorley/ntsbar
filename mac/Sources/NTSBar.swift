@@ -236,6 +236,19 @@ struct SonosRoom: Hashable {
 
     func stop() async throws { _ = try await Self.soap(host, "MediaRenderer/AVTransport", "Stop", "<InstanceID>0</InstanceID>") }
 
+    /// The group's volume (0–100): all its rooms together, as the Sonos app's group slider.
+    func volume() async throws -> Int {
+        let r = try await Self.soap(host, "MediaRenderer/GroupRenderingControl", "GetGroupVolume", "<InstanceID>0</InstanceID>")
+        guard let v = r.firstMatch(of: /<CurrentVolume>(\d+)/).flatMap({ Int($0.1) }) else { throw APIError(errorDescription: "Sonos volume unreadable") }
+        return v
+    }
+
+    func setVolume(_ v: Int) async throws {
+        // the snapshot keeps the rooms' levels in proportion as the group's moves
+        _ = try await Self.soap(host, "MediaRenderer/GroupRenderingControl", "SnapshotGroupVolume", "<InstanceID>0</InstanceID>")
+        _ = try await Self.soap(host, "MediaRenderer/GroupRenderingControl", "SetGroupVolume", "<InstanceID>0</InstanceID><DesiredVolume>\(v)</DesiredVolume>")
+    }
+
     private static func soap(_ host: String, _ path: String, _ action: String, _ args: String = "") async throws -> String {
         let service = path.split(separator: "/").last!
         var r = URLRequest(url: URL(string: "http://\(host):1400/\(path)/Control")!, timeoutInterval: 5)
@@ -378,6 +391,13 @@ enum Keychain {
     var rooms: [SonosRoom] = []   // found at launch and again whenever the mini player shows
     var speaker: SonosRoom? { didSet { UserDefaults.standard.set(speaker?.name, forKey: "speaker") } }   // chosen output for live and mixtapes; nil plays on this Mac
     var cast: SonosRoom?   // the room actually playing our stream now
+    var volume: Int?   // the chosen room's, read when it's picked or the rooms are looked up again
+
+    func setVolume(_ v: Int) {
+        guard let s = speaker else { return }
+        volume = v
+        Task { try? await s.setVolume(v) }
+    }
 
     /// Starts the playing item's stream: on the chosen Sonos room for live and mixtapes, else (and for archive episodes) on the Mac.
     private func load(_ u: URL) {
@@ -407,6 +427,7 @@ enum Keychain {
         rooms = await SonosRoom.discover()
         let name = speaker?.name ?? UserDefaults.standard.string(forKey: "speaker")
         if let r = rooms.first(where: { $0.name == name }), r != speaker { setSpeaker(r) }
+        if let s = speaker, let v = try? await s.volume(), speaker == s { volume = v }   // the Sonos app or buttons may have moved it
         // The room still playing an NTS stream (from before a relaunch, or picked in the Sonos app): shown here so pause and stop work
         guard playingID == nil, let s = speaker, let uri = try? await s.playingURI(), playingID == nil,
               let (id, url) = (liveStreams.map { ($0.key, $0.value) } + mixtapes.map { ($0.id, $0.audioStreamEndpoint) })
@@ -419,6 +440,8 @@ enum Keychain {
     func setSpeaker(_ s: SonosRoom?) {
         guard s != speaker else { return }
         speaker = s
+        volume = nil
+        if let s { Task { if let v = try? await s.volume(), speaker == s { volume = v } } }
         if playingID != nil, !paused, episode?.id != playingID, let u = streamURL { load(u) }
     }
 
@@ -2107,20 +2130,7 @@ struct MiniPlayer: View {
                     }
                 }
                 Spacer(minLength: 8)
-                if !store.rooms.isEmpty {
-                    Menu {
-                        Picker("Play on", selection: Binding(get: { store.speaker }, set: { store.setSpeaker($0) })) {
-                            Text("This Mac").tag(SonosRoom?.none)
-                            ForEach(store.rooms, id: \.self) { Text($0.name).tag(Optional($0)) }
-                        }
-                        .pickerStyle(.inline)
-                    } label: {
-                        Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14))
-                    }
-                    .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
-                    .help(store.cast.map { "Playing on \($0.name)" } ?? "Play on Sonos")
-                    .padding(.trailing, 14)
-                }
+                if !store.rooms.isEmpty { SpeakerButton().padding(.trailing, 14) }
                 Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
             }
             .contentShape(.rect)
@@ -2145,6 +2155,52 @@ struct MiniPlayer: View {
             return (e.details.media?.thumb, e.details.name ?? "", "\(clock(store.position)) / \(clock(store.duration))")
         }
         return (nil, "", "")
+    }
+}
+
+/// The mini player's output picker: This Mac or a Sonos room, and the room's volume, in a popover (a menu can't hold a slider).
+/// Stays open after a pick, so the volume can follow.
+struct SpeakerButton: View {
+    @Environment(Store.self) var store
+    @State private var open = false
+
+    var body: some View {
+        Button { open.toggle() } label: {
+            Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14)).contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .help(store.cast.map { "Playing on \($0.name)" } ?? "Play on Sonos")
+        .popover(isPresented: $open, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 2) {
+                row("This Mac", nil)
+                ForEach(store.rooms, id: \.self) { row($0.name, $0) }
+                if store.speaker != nil {
+                    HStack(spacing: 8) {
+                        Image(systemName: "speaker.fill").font(.system(size: 11)).opacity(0.6)
+                        // sent once the drag ends: one request per tick could land out of order
+                        Slider(value: Binding(get: { Double(store.volume ?? 0) }, set: { store.volume = Int($0) }), in: 0...100) { editing in
+                            if !editing, let v = store.volume { store.setVolume(v) }
+                        }
+                        .disabled(store.volume == nil)
+                        Image(systemName: "speaker.wave.3.fill").font(.system(size: 11)).opacity(0.6)
+                    }
+                    .padding(.horizontal, 8).padding(.top, 10)
+                }
+            }
+            .padding(10).frame(width: 220)
+        }
+    }
+
+    func row(_ name: String, _ room: SonosRoom?) -> some View {
+        Button { store.setSpeaker(room) } label: {
+            HStack {
+                Text(name.nts).font(.nts(13)).lineLimit(1)
+                Spacer()
+                if store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
+            }
+            .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
+        }
+        .buttonStyle(.plain)
     }
 }
 
