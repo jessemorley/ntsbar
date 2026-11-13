@@ -241,13 +241,13 @@ struct SonosRoom: Hashable {
         }
     }
 
-    /// Where the track is and whether it's PLAYING, PAUSED_PLAYBACK, STOPPED or TRANSITIONING.
-    func position() async throws -> (seconds: Double, state: String) {
+    /// Where the track is, whether it's PLAYING, PAUSED_PLAYBACK, STOPPED or TRANSITIONING, and which track it is.
+    func position() async throws -> (seconds: Double, state: String, track: String?) {
         let state = try await Self.soap(host, "MediaRenderer/AVTransport", "GetTransportInfo", "<InstanceID>0</InstanceID>")
             .firstMatch(of: /<CurrentTransportState>([A-Z_]+)/).map { String($0.1) } ?? ""
-        let rel = try await Self.soap(host, "MediaRenderer/AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
-            .firstMatch(of: /<RelTime>(\d+):(\d+):(\d+)/).map { Double(Int($0.1)! * 3600 + Int($0.2)! * 60 + Int($0.3)!) } ?? 0
-        return (rel, state)
+        let info = try await Self.soap(host, "MediaRenderer/AVTransport", "GetPositionInfo", "<InstanceID>0</InstanceID>")
+        let rel = info.firstMatch(of: /<RelTime>(\d+):(\d+):(\d+)/).map { Double(Int($0.1)! * 3600 + Int($0.2)! * 60 + Int($0.3)!) } ?? 0
+        return (rel, state, info.firstMatch(of: /<TrackURI>([^<]*)/).map { String($0.1).replacing("&amp;", with: "&") })
     }
 
     /// How Sonos names a stream we gave it; it keeps this as CurrentURI while following the geo redirects itself.
@@ -342,12 +342,20 @@ struct SonosRoom: Hashable {
             l.start(queue: .main)
         }
         url = URL(string: "http://\(ip):\(port)\(path).mp3")
-        awake = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Playing an episode on Sonos")   // no idle sleep, no App Nap
+    }
+
+    /// While the room plays: no idle sleep, no App Nap. Paused, the Mac may sleep (resume then reads afresh).
+    var playing = false {
+        didSet {
+            guard playing != oldValue else { return }
+            if playing { awake = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Playing an episode on Sonos") }
+            else if let a = awake { ProcessInfo.processInfo.endActivity(a); awake = nil }
+        }
     }
 
     func stop() {
         listener?.cancel(); listener = nil
-        if let a = awake { ProcessInfo.processInfo.endActivity(a); awake = nil }
+        playing = false
     }
 
     private func read(_ playlist: URL) async throws {
@@ -440,7 +448,7 @@ enum Keychain {
     }
     let player = AVPlayer()
     var episode: (id: String, details: Details)?   // the archive episode loaded for playback
-    var paused = false                              // archive only; live and mixtapes stop instead
+    var paused = false { didSet { relay?.playing = !paused } }   // archive only; live and mixtapes stop instead
     var resolving = false   // fetching an archive episode's stream, before the player has an item
     var buffering = false   // player is waiting for audio
     var loading: Bool { resolving || buffering }
@@ -575,7 +583,7 @@ enum Keychain {
             return
         }
         let r = EpisodeRelay(playlist: u) { try await resolveStream(source) }
-        relay = r; castClock = (start, .now)
+        relay = r; castClock = (start, .now); r.playing = !paused
         Task {
             do { try await r.start(for: s.host, path: id ?? "/episode") } catch {
                 guard relay === r else { return r.stop() }
@@ -596,9 +604,16 @@ enum Keychain {
     }
 
     private func playHere(_ u: URL, at start: Double) {
-        player.replaceCurrentItem(with: AVPlayerItem(url: u))
+        let item = AVPlayerItem(url: u)
+        player.replaceCurrentItem(with: item)
         if start > 0 { player.seek(to: CMTime(seconds: start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
         player.play()
+        guard episode?.id == playingID else { return }   // live and mixtapes have no duration
+        Task {   // HLS duration arrives once the playlist loads
+            for await d in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values where player.currentItem === item {
+                duration = d.seconds.isFinite ? d.seconds : 0; nowPlaying()
+            }
+        }
     }
 
     private func castFailed(_ s: SonosRoom, _ id: String?) {
@@ -617,7 +632,13 @@ enum Keychain {
             while relay === r {
                 try? await Task.sleep(for: .seconds(5))
                 let asked = Date.now
-                guard let (pos, state) = try? await s.position(), relay === r, castCommandAt < asked else { continue }
+                guard let (pos, state, track) = try? await s.position(), relay === r, castCommandAt < asked else { continue }
+                // another source took the room (Spotify, the Sonos app): let it go, no Stop; play picks up here
+                if state != "STOPPED", let track, track != r.url?.absoluteString {
+                    if !paused { castClock = (position, .now); listenStop(); paused = true }
+                    relay?.stop(); relay = nil; cast = nil; nowPlaying()
+                    return
+                }
                 switch state {
                 case "PLAYING": castClock = (pos, .now); if paused { paused = false; listenStart(); nowPlaying() }
                 case "PAUSED_PLAYBACK": if !paused { castClock = (pos, .now); listenStop(); paused = true; nowPlaying() }
@@ -661,7 +682,7 @@ enum Keychain {
         let r = EpisodeRelay(playlist: hls) { try await resolveStream(source) }
         // another Mac's relay, or the port's taken: not ours to pick up
         guard (try? await r.start(for: s.host, path: id, port: port)) != nil, r.url?.absoluteString == uri, playingID == nil,
-              let (pos, _) = try? await s.position() else { return r.stop() }
+              let (pos, _, _) = try? await s.position() else { return r.stop() }
         episode = (id, d); playingID = id; streamURL = hls; resolvedAt = .now
         cast = s; relay = r; duration = r.seconds; paused = !playing; streamError = nil
         castClock = (pos, .now)
@@ -768,13 +789,6 @@ enum Keychain {
             episode = (id, d)
             toggle(id, hls.absoluteString)
             listenStart()
-            if let item = player.currentItem {   // HLS duration arrives once the playlist loads
-                Task {
-                    for await d in item.publisher(for: \.duration).first(where: { $0.seconds > 0 }).values where player.currentItem === item {
-                        duration = d.seconds.isFinite ? d.seconds : 0; nowPlaying()
-                    }
-                }
-            }
             problem = nil
         } catch { if pendingID == id { pendingID = nil }; report(error) }
     }
@@ -2455,7 +2469,8 @@ struct SpeakerButton: View {
             HStack {
                 Text(name.nts).font(.nts(13)).lineLimit(1)
                 Spacer()
-                if store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
+                // while playing, where it actually plays (an episode Sonos can't take falls back to the Mac); else the chosen output
+                if (store.playingID != nil && !store.paused ? store.cast : store.speaker) == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
             }
             .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
         }
