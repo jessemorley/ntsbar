@@ -645,6 +645,7 @@ enum Keychain {
 
     private func playHere(_ u: URL, at start: Double) {
         let item = AVPlayerItem(url: u)
+        item.preferredForwardBufferDuration = 60   // left to itself an episode reads ~15 min ahead: +30 MB, not +15
         player.replaceCurrentItem(with: item)
         if start > 0 { player.seek(to: CMTime(seconds: start, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) }
         player.play()
