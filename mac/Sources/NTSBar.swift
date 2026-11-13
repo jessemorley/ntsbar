@@ -1272,7 +1272,7 @@ struct ReplayIcon: View {
 struct ChannelCard: View {
     @Environment(Store.self) var store
     let channel: Channel
-    var openSchedule: () -> Void = {}
+    let openSchedule: () -> Void
 
     var body: some View {
         let d = channel.now.embeds?.details
@@ -1461,7 +1461,17 @@ struct SavedView: View {
     var header: some View {
         HStack(spacing: 6) {
             // round pills, so they read as the page's filter, not a second tab bar (square boxes are the genre tags'); selected filled white
-            ForEach(SavedTab.allCases, id: \.self) { t in Pill(text: t.rawValue, on: tab == t) { tab = t } }
+            ForEach(SavedTab.allCases, id: \.self) { t in
+                Button { tab = t } label: {
+                    Text(t.rawValue.nts).font(.nts(11))
+                        .foregroundStyle(tab == t ? .black : .white)
+                        .padding(.horizontal, 11).padding(.vertical, 5)
+                        .background(tab == t ? .white : .clear, in: .capsule)
+                        .overlay { Capsule().strokeBorder(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
+                        .contentShape(.capsule)
+                }
+                .buttonStyle(.plain)
+            }
             Spacer(minLength: 0)
             Menu {
                 if let e = store.email {
@@ -1507,22 +1517,6 @@ struct SavedView: View {
 
     func empty(_ text: String) -> some View {
         Text(text.nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
-    }
-}
-
-/// A page's filter (My NTS lists, schedule channel): round, selected filled white.
-struct Pill: View {
-    let text: String, on: Bool, action: () -> Void
-    var body: some View {
-        Button(action: action) {
-            Text(text.nts).font(.nts(11))
-                .foregroundStyle(on ? .black : .white)
-                .padding(.horizontal, 11).padding(.vertical, 5)
-                .background(on ? .white : .clear, in: .capsule)
-                .overlay { Capsule().strokeBorder(.white.opacity(on ? 1 : 0.35), lineWidth: 1) }
-                .contentShape(.capsule)
-        }
-        .buttonStyle(.plain)
     }
 }
 
