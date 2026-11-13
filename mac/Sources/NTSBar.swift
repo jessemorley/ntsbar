@@ -372,7 +372,7 @@ enum Keychain {
     private func load(_ u: URL) {
         if let c = cast, c != speaker || episode?.id == playingID { stopCast(c) }
         guard let s = speaker, episode?.id != playingID else { player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play(); return }
-        player.replaceCurrentItem(with: nil)
+        player.pause(); player.replaceCurrentItem(with: nil)   // paused first: a playing player with no item reports waiting, which shows as loading
         cast = s
         let id = playingID, title = mixtapes.first { $0.id == id }?.title ?? "NTS \(id ?? "")"
         Task {
@@ -2090,7 +2090,6 @@ struct MiniPlayer: View {
                             ForEach(store.rooms, id: \.self) { Text($0.name).tag(Optional($0)) }
                         }
                         .pickerStyle(.inline)
-                        Text("Sonos plays live and mixtapes; episodes stay on this Mac")
                     } label: {
                         Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14))
                     }
