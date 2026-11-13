@@ -73,8 +73,10 @@ func fetch<T: Decodable>(_ path: String) async throws -> [T] {
 
 func fetchOne<T: Decodable>(_ path: String, as: T.Type = T.self, query: [URLQueryItem] = []) async throws -> T {
     // API sends max-age=900 and CloudFront caches per header variant, so a show change can lag up to
-    // 15 min. A timestamp query makes each request a cache miss (one small request a minute).
-    let url = api.appending(path: path).appending(queryItems: query + [.init(name: "t", value: String(Int(Date().timeIntervalSince1970)))])
+    // 15 min. On /live a timestamp query makes each request a cache miss (one small request a minute);
+    // everything else (episode details, tracklists, show pages) is fine served from the CDN.
+    let bust = path == "live" ? [URLQueryItem(name: "t", value: String(Int(Date().timeIntervalSince1970)))] : []
+    let url = api.appending(path: path).appending(queryItems: query + bust)
     let (data, _) = try await URLSession.shared.data(for: URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData))
     let d = JSONDecoder()
     d.keyDecodingStrategy = .convertFromSnakeCase
@@ -203,6 +205,7 @@ enum Keychain {
     var mixtapeNow: (title: String, path: String?)?   // the episode the playing mixtape is on
     var error: String?
     var tracklists: [String: [Track]] = [:]   // by episode path
+    var details: [String: Details] = [:]   // My NTS rows' full details, by id, so rows scrolled back into view don't refetch
     var saved: [Saved] = (UserDefaults.standard.data(forKey: "saved"))
         .flatMap { try? JSONDecoder().decode([Saved].self, from: $0) } ?? [] {
         didSet { UserDefaults.standard.set(try? JSONEncoder().encode(saved), forKey: "saved") }
@@ -274,6 +277,7 @@ enum Keychain {
         guard let u = URL(string: url) else { return }
         listenStop()
         streamError = nil
+        retries = 0; retrying = false   // a new stream's failures count afresh, even mid-wait
         streamURL = u
         duration = 0
         player.replaceCurrentItem(with: AVPlayerItem(url: u))
@@ -293,7 +297,7 @@ enum Keychain {
     nonisolated private func observeStatus() -> NSKeyValueObservation {
         player.observe(\.timeControlStatus) { [weak self] p, _ in
             let waiting = p.timeControlStatus == .waitingToPlayAtSpecifiedRate, playing = p.timeControlStatus == .playing && p.currentItem?.status == .readyToPlay   // switching items briefly reports .playing for the old one
-            Task { @MainActor in self?.buffering = waiting; if playing { self?.pendingID = nil } }
+            Task { @MainActor in self?.buffering = waiting; if playing { self?.pendingID = nil; self?.retries = 0 } }
         }
     }
 
@@ -306,9 +310,27 @@ enum Keychain {
         }
     }
 
-    /// Leaves the item in the mini player, paused, with the reason in place of its subtitle; play retries.
+    @ObservationIgnored private var retries = 0   // reloads since the stream last played
+    @ObservationIgnored private var retrying = false   // one failure can report twice (item status and the mid-play notification)
+
+    /// Live and mixtapes first reload a few times (2, 4, 8s apart): a Wi-Fi blip or waking from sleep drops them.
+    /// Then, or for an archive episode, leaves the item in the mini player, paused, with the reason in place of its subtitle; play retries.
     func streamFailed(_ why: String?) {
-        guard playingID != nil else { return }
+        guard let id = playingID, !retrying else { return }
+        if episode?.id != id, retries < 3, let u = streamURL {
+            retries += 1
+            retrying = true
+            buffering = true   // the shimmer, while it waits
+            Task { [wait = Double(1 << retries)] in
+                try? await Task.sleep(for: .seconds(wait))
+                retrying = false
+                // stopped or paused meanwhile: the failed item reports no status change to clear the shimmer
+                // (switched: the new item's status takes over)
+                guard playingID == id, !paused, streamURL == u else { if playingID == nil || paused { buffering = false }; return }
+                player.replaceCurrentItem(with: AVPlayerItem(url: u)); player.play()
+            }
+            return
+        }
         listenStop(); player.pause(); paused = true; pendingID = nil
         streamError = "Can't play stream" + (why.map { ". \($0)" } ?? "")
         nowPlaying()
@@ -624,16 +646,25 @@ enum Keychain {
         UserDefaults.standard.removeObject(forKey: "email")
     }
 
+    @ObservationIgnored private var refreshing: Task<(token: String, uid: String), Error>?
+
     /// A valid ID token, refreshed from the Keychain's refresh token when expired.
+    /// Calls that arrive mid-refresh (a page of bookmark checks) wait on the same one.
     private func token() async throws -> (token: String, uid: String) {
         if let s = session, s.expires > .now { return (s.token, s.uid) }
-        guard let refresh = Keychain.refreshToken else { throw APIError(errorDescription: "Signed out, sign in again") }
-        let r = try await post("https://securetoken.googleapis.com/v1/token?key=\(firebaseKey)",
-                               ["grant_type": "refresh_token", "refresh_token": refresh]) as? [String: Any] ?? [:]
-        guard let t = r["id_token"] as? String, let uid = r["user_id"] as? String else { throw APIError(errorDescription: "Unexpected token reply") }
-        Keychain.refreshToken = r["refresh_token"] as? String ?? refresh
-        session = (t, uid, .now + 3000)
-        return (t, uid)
+        if let refreshing { return try await refreshing.value }
+        let task = Task { () throws -> (token: String, uid: String) in
+            guard let refresh = Keychain.refreshToken else { throw APIError(errorDescription: "Signed out, sign in again") }
+            let r = try await post("https://securetoken.googleapis.com/v1/token?key=\(firebaseKey)",
+                                   ["grant_type": "refresh_token", "refresh_token": refresh]) as? [String: Any] ?? [:]
+            guard let t = r["id_token"] as? String, let uid = r["user_id"] as? String else { throw APIError(errorDescription: "Unexpected token reply") }
+            Keychain.refreshToken = r["refresh_token"] as? String ?? refresh
+            session = (t, uid, .now + 3000)
+            return (t, uid)
+        }
+        refreshing = task
+        defer { refreshing = nil }
+        return try await task.value
     }
 
     /// Next page of hosts or episodes, from the callable functions nts.live's My NTS pages use.
@@ -791,7 +822,14 @@ extension ScrollGeometry {
 
 extension String {
     /// API titles carry HTML entities (e.g. &amp;).
-    var htmlDecoded: String { replacing("&amp;", with: "&").replacing("&#39;", with: "'").replacing("&quot;", with: "\"") }
+    /// Numeric entities (&#39; &#8217; &#x2019;) plus the named ones titles use; &amp; last so "&amp;lt;" stays "&lt;".
+    var htmlDecoded: String {
+        replacing(/&#([xX]?)([0-9a-fA-F]+);/) { m in
+            UInt32(m.2, radix: m.1.isEmpty ? 10 : 16).flatMap(Unicode.Scalar.init).map { String(Character($0)) } ?? String(m.0)
+        }
+        .replacing("&quot;", with: "\"").replacing("&apos;", with: "'").replacing("&lt;", with: "<").replacing("&gt;", with: ">")
+        .replacing("&nbsp;", with: " ").replacing("&amp;", with: "&")
+    }
     /// Uppercased, with U+2005 spaces: Univers Condensed kerns the plain space against W and "-",
     /// shrinking gaps ("SHOWW/", "18:00- 20:00"); CoreText applies those pairs even with kerning 0.
     var nts: String { uppercased().replacing(" ", with: "\u{2005}") }
@@ -1269,11 +1307,14 @@ struct SavedView: View {
 
 /// A My NTS item as an EpisodeRow; the feed's article is thin, so the full details (artwork, genres) load per row.
 struct SavedRow: View {
+    @Environment(Store.self) var store
     let s: Saved, open: () -> Void
-    @State private var d: Details?
     var body: some View {
-        EpisodeRow(id: s.id, d: d ?? Details(name: s.title), subtitle: s.subtitle, image: s.image, open: open)
-            .task { d = try? await fetchOne(String(s.id.dropFirst())) }
+        EpisodeRow(id: s.id, d: store.details[s.id] ?? Details(name: s.title), subtitle: s.subtitle, image: s.image, open: open)
+            .task {
+                guard store.details[s.id] == nil, let d: Details = try? await fetchOne(String(s.id.dropFirst())) else { return }
+                store.details[s.id] = d
+            }
     }
 }
 
@@ -1793,7 +1834,8 @@ struct ChannelNowView: View {
                         HStack {
                             Text(hours(b.startTimestamp, end).nts)
                             Spacer()
-                            Text("\(Int(end.timeIntervalSince(ctx.date) / 60)) MIN LEFT".nts).opacity(0.6)
+                            // 0, not negative, while an overrun waits for the next poll
+                            Text("\(max(0, Int(end.timeIntervalSince(ctx.date) / 60))) MIN LEFT".nts).opacity(0.6)
                         }
                         .font(.nts(10.5, .regular)).padding(.horizontal, pageInset).padding(.top, 7)
                         EpisodeInfo(details: d, tracks: tracks) { store.showTracklist = true }
