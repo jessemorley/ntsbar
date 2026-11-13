@@ -2419,7 +2419,7 @@ struct SpeakerButton: View {
         .buttonStyle(.plain)
         .background { AirPlayPicker(player: store.player, show: airplay) { store.setSpeaker(nil) } }   // under the button, so it never takes its clicks
         .help(store.cast.map { "Playing on \($0.name)" } ?? "Sonos or AirPlay")
-        .popover(isPresented: $open, arrowEdge: .top) {
+        .popover(isPresented: $open, arrowEdge: .bottom) {   // downward, as the system AirPlay list opens
             VStack(alignment: .leading, spacing: 2) {
                 row("This Mac", nil)
                 ForEach(store.rooms, id: \.self) { row($0.name, $0) }
