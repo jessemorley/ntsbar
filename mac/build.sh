@@ -23,6 +23,9 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>27.0</string>
+  <key>NSLocalNetworkUsageDescription</key><string>NTS finds Sonos speakers on your network to play radio on them.</string>
+  <key>NSBonjourServices</key><array><string>_sonos._tcp</string></array>
+  <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 PLIST
 # Stable signature so the keychain item's ACL survives rebuilds (ad-hoc cdhash changes every build)
