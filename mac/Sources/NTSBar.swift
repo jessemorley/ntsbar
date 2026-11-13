@@ -35,7 +35,12 @@ struct Broadcast: Decodable {
     var bareTitle: String { isReplay ? String(title.dropLast(4)) : title }
     var embeds: Embeds?
     struct Embeds: Decodable { var details: Details? }
+    var links: [Link]?   // schedule only: …/api/v2/shows/x/episodes/y
+    struct Link: Decodable { var href: String }
+    var showPath: String? { links?.first.flatMap { $0.href.firstMatch(of: /\/shows\/[^\/?]+/) }.map { String($0.output) } }
 }
+/// /radio/schedule/{1,2}: this week and next, past slots included, one entry per UTC day.
+struct ScheduleDay: Decodable { var broadcasts: [Broadcast] }
 struct Channel: Decodable, Identifiable {
     var channelName: String, now: Broadcast
     var upcoming: [Broadcast]   // API flattens the schedule into next, next2 … next17
@@ -228,6 +233,8 @@ enum Keychain {
     var streamError: String?   // shown in the mini player while the failed item sits paused
     var showTracklist = false   // Now Playing shows the tracklist in place of the episode page (the mini player's track opens it)
     var followed: [String: Bool] = [:]   // account state of bookmarked show/episode ids, checked on demand
+    var schedules: [String: [Broadcast]] = [:]   // by channel: this week and next (/radio/schedule)
+    @ObservationIgnored private var schedulesAt = Date.distantPast
     @ObservationIgnored private var session: (token: String, uid: String, expires: Date)?
     @ObservationIgnored private var deviceIDs: [String] = []
 
@@ -235,6 +242,7 @@ enum Keychain {
         Task {
             while true {
                 do { live = try await fetch("live"); error = nil; if liveStreams[playingID ?? ""] != nil { nowPlaying() } } catch { self.error = "Can't reach NTS" }
+                Task { await loadSchedules() }   // throttled to every 15 min
                 // poll every 60s, but also wake just after the earliest current show ends
                 let ends = live.compactMap(\.now.endTimestamp).map { $0.timeIntervalSinceNow + 5 }.filter { $0 > 0 }
                 try? await Task.sleep(for: .seconds(min(60, ends.min() ?? 60)))
@@ -544,6 +552,29 @@ enum Keychain {
                 report(error)
             }
         }
+    }
+
+    /// Both channels' schedules, refetched once over 15 min old (the API's max-age); a failure retries next call.
+    func loadSchedules() async {
+        guard schedulesAt < .now - 900 else { return }
+        schedulesAt = .now   // also keeps a second caller from fetching alongside
+        do {
+            for ch in liveStreams.keys.sorted() {
+                let days: [ScheduleDay] = try await fetch("radio/schedule/\(ch)")
+                schedules[ch] = days.flatMap(\.broadcasts)
+            }
+        } catch { schedulesAt = .distantPast }
+    }
+
+    /// Every followed show's id (/shows/x): the whole hosts feed when signed in, else the local saves.
+    func followedShows() async -> Set<String> {
+        guard email != nil else { return Set(saved.filter { !$0.isEpisode }.map(\.id)) }
+        var n = -1
+        while feeds[.hosts]?.done != true, feeds[.hosts]?.items.count != n {   // stops when a page adds nothing (failed, or already loading)
+            n = feeds[.hosts]?.items.count ?? 0
+            await loadMore(.hosts)
+        }
+        return Set(feeds[.hosts]?.items.map(\.id) ?? [])
     }
 
     /// Reads the account state for bookmark icons once per id.
@@ -1015,17 +1046,198 @@ struct RootView: View {
 
 struct LiveView: View {
     @Environment(Store.self) var store
+    // a channel's schedule, in place of the cards; `--snapshot out.png --schedule 2` opens one
+    @State private var schedule: String? = CommandLine.arguments.firstIndex(of: "--schedule").flatMap { i in
+        CommandLine.arguments.indices.contains(i + 1) ? CommandLine.arguments[i + 1] : nil
+    }
 
     var body: some View {
+        // parallax push: the schedule slides in from the right edge over the cards, which drift a third as far left
+        ZStack(alignment: .top) {
+            if let ch = schedule {
+                ScheduleView(tab: ch) { open(nil) }
+                    .background(.black)
+                    // Live keeps its tab bar: no inset under it, no hiding on scroll
+                    .environment(\.tabBar, TabBarInset())
+                    .transformPreference(ScrolledDown.self) { $0 = false }
+                    .transition(.move(edge: .trailing))
+                    .zIndex(1)
+            } else {
+                cards.transition(.offset(x: -120))
+            }
+        }
+    }
+
+    func open(_ ch: String?) { withAnimation(.easeOut(duration: 0.3)) { schedule = ch } }
+
+    var cards: some View {
         VStack(spacing: 0) {
             if let e = store.error { Text(e.uppercased()).font(.nts(14)).opacity(0.6).padding() }
-            ForEach(Array(store.live.enumerated()), id: \.element.id) { i, c in
-                ChannelCard(channel: c)
+            ForEach(store.live) { c in
+                ChannelCard(channel: c) { open(c.id) }
             }
             if store.live.isEmpty && store.error == nil { ProgressView().frame(maxHeight: .infinity) }
         }
         // the mini player appears instantly; the cards ease into the room left for it
         .animation(.easeOut(duration: 0.2), value: store.playingID != nil)
+    }
+}
+
+/// The schedule as in the iPhone app: white day bars, time · title · rerun mark, a red dot on what's on now
+/// (with its description). Past slots dimmed; opens scrolled to now. A row opens its show.
+/// Tabs: each channel, then the followed shows on both (each title led by its channel box).
+struct ScheduleView: View {
+    @Environment(Store.self) var store
+    @State var tab: String   // a channel ("1", "2") or "following"
+    let back: () -> Void
+    struct Slot { var channel: String, b: Broadcast; var id: String { channel + b.startTimestamp.ISO8601Format() } }
+    @State private var followed: Set<String>?   // followed show ids, once loaded
+    @State private var show: Saved?
+    var following: Bool { tab == "following" }
+
+    var body: some View {
+        if let s = show { ShowView(show: s) { show = nil } } else { list }
+    }
+
+    var list: some View {
+        let now = Date(), loaded = self.slots, slots = loaded ?? []
+        let days = Dictionary(grouping: slots) { Calendar.current.startOfDay(for: $0.b.startTimestamp) }.sorted { $0.key < $1.key }
+        // the slot before what's on, so the list opens with a little of the past above
+        let i = slots.firstIndex { ($0.b.endTimestamp ?? $0.b.startTimestamp) > now }
+        let anchor = i.map { slots[max($0 - 1, 0)].id }
+        return VStack(spacing: 0) {
+            header
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(days, id: \.key) { day in
+                            dayBar(day.key)
+                            ForEach(day.value, id: \.id) { row($0, now) }
+                        }
+                        if loaded == nil { ProgressView().controlSize(.small).frame(maxWidth: .infinity).padding(16) }
+                        else if slots.isEmpty {
+                            Text("NO FOLLOWED SHOWS ON THE SCHEDULE".nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
+                        }
+                    }
+                }
+                .onAppear { if let anchor { proxy.scrollTo(anchor, anchor: .top) } }
+                .onChange(of: anchor) { if let anchor { proxy.scrollTo(anchor, anchor: .top) } }
+            }
+        }
+        .task { await store.loadSchedules() }   // usually a no-op: fetched at launch, refreshed by the live poll
+        .task(id: following) { if following { followed = await store.followedShows() } }
+    }
+
+    /// From the store's cached schedules, so the view slides in already filled; nil until they (and follows) are in.
+    var slots: [Slot]? {
+        let chans = following ? liveStreams.keys.sorted() : [tab]
+        var all: [Slot] = []
+        for ch in chans {
+            guard let bs = store.schedules[ch] else { return nil }
+            all += bs.map { Slot(channel: ch, b: $0) }
+        }
+        guard following else { return all }
+        guard let ids = followed else { return nil }
+        return all.filter { $0.b.showPath.map(ids.contains) == true }.sorted { $0.b.startTimestamp < $1.b.startTimestamp }
+    }
+
+    var header: some View {
+        HStack(spacing: 16) {
+            Button(action: back) {
+                HStack(spacing: 2) {
+                    Image(systemName: "chevron.left").font(.nts(15)).frame(width: 28, height: 28)
+                    Text("SCHEDULE".nts).font(.nts(15))
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+            ForEach(liveStreams.keys.sorted(), id: \.self) { c in
+                tabButton(c) { HStack(spacing: 5) { Text("LIVE".nts).font(.nts(13)); ChannelBox(channel: c) } }
+            }
+            tabButton("following") { FollowingIcon() }
+        }
+        .padding(.leading, 4).padding(.trailing, pageInset).padding(.vertical, 8)
+    }
+
+    func tabButton(_ t: String, @ViewBuilder label: () -> some View) -> some View {
+        Button { tab = t } label: { label().frame(height: 28).contentShape(.rect) }
+            .buttonStyle(.plain).opacity(tab == t ? 1 : 0.45)
+    }
+
+    func dayBar(_ day: Date) -> some View {
+        let cal = Calendar.current
+        let name = cal.isDateInToday(day) ? "Today" : cal.isDateInTomorrow(day) ? "Tomorrow"
+            : cal.isDateInYesterday(day) ? "Yesterday" : day.formatted(.dateTime.weekday(.wide))
+        let date = Text(", " + day.formatted(.dateTime.day().month(.abbreviated)).nts).font(.nts(14, .regular))
+        return Text("\(Text(name.nts).font(.nts(14)))\(date)")
+            .foregroundStyle(.black)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, pageInset).padding(.vertical, 9)
+            .background(.white)
+    }
+
+    func row(_ s: Slot, _ now: Date) -> some View {
+        let b = s.b, end = b.endTimestamp ?? b.startTimestamp
+        let onNow = b.startTimestamp <= now && now < end
+        let live = store.live.first { $0.id == s.channel }?.now
+        let desc = onNow && live?.startTimestamp == b.startTimestamp ? live?.embeds?.details?.description : nil
+        return Button {
+            if let p = b.showPath { show = Saved(id: p, title: b.bareTitle, subtitle: "") }
+        } label: {
+            HStack(alignment: .firstTextBaseline, spacing: 0) {
+                Text(hours(b.startTimestamp, end).nts).font(.nts(13, onNow ? .bold : .regular))
+                    .frame(width: 82, alignment: .leading)
+                Circle().fill(.red).frame(width: 6, height: 6).opacity(onNow ? 1 : 0)
+                    .frame(width: 14, alignment: .leading)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        if following { ChannelBox(channel: s.channel) }
+                        Text(b.bareTitle.nts).font(.nts(14)).fixedSize(horizontal: false, vertical: true)
+                    }
+                    if let desc, !desc.isEmpty { Text(desc).font(.system(size: 12)).opacity(0.8).lineLimit(5) }
+                }
+                Spacer(minLength: 8)
+                if b.isReplay { ReplayIcon(size: 12) }
+            }
+            .padding(.horizontal, pageInset).padding(.vertical, 9)
+            .opacity(end <= now ? 0.45 : 1)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// A channel's number, black in a white box (Live cards, schedule).
+struct ChannelBox: View {
+    let channel: String
+    var body: some View {
+        Text(channel).font(.nts(11)).foregroundStyle(.black).frame(width: 11, height: 12).background(.white)
+    }
+}
+
+/// Square-cornered calendar, no day dots: outline, solid header band, two rings poking above it.
+struct CalendarIcon: View {
+    var size: CGFloat = 20
+    var body: some View {
+        Canvas { ctx, s in
+            let w = s.width, lw = w * 0.09, top = w * 0.12
+            ctx.stroke(Path(CGRect(x: lw / 2, y: top + lw / 2, width: w - lw, height: w - top - lw)), with: .foreground, lineWidth: lw)
+            ctx.fill(Path(CGRect(x: 0, y: top, width: w, height: w * 0.25)), with: .foreground)
+            for x in [0.3, 0.7] { ctx.fill(Path(CGRect(x: w * x - lw / 2, y: 0, width: lw, height: top + lw)), with: .foreground) }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+/// Calendar with a heart: the schedule's followed-shows tab.
+struct FollowingIcon: View {
+    var body: some View {
+        CalendarIcon(size: 17)
+            .overlay(alignment: .bottomTrailing) {
+                Image(systemName: "heart.fill").font(.system(size: 8)).padding(1.5)
+                    .background(.black, in: .circle).offset(x: 4, y: 3)
+            }
     }
 }
 
@@ -1060,6 +1272,7 @@ struct ReplayIcon: View {
 struct ChannelCard: View {
     @Environment(Store.self) var store
     let channel: Channel
+    var openSchedule: () -> Void = {}
 
     var body: some View {
         let d = channel.now.embeds?.details
@@ -1070,8 +1283,7 @@ struct ChannelCard: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 5) {
                     Circle().fill(.red).frame(width: 5, height: 5)
-                    Text(channel.channelName).font(.nts(11)).foregroundStyle(.black)
-                        .frame(width: 11, height: 12).background(.white)
+                    ChannelBox(channel: channel.channelName)
                     Text((d?.locationLong ?? "").nts).font(.nts(12.5, .regular))
                         .padding(.leading, 2)
                 }
@@ -1097,7 +1309,10 @@ struct ChannelCard: View {
                     }
                     .buttonStyle(.plain)
                     Spacer()
-                    SaveMenu(details: channel.now.embeds?.details, title: channel.now.title, date: channel.now.startTimestamp)
+                    Button(action: openSchedule) {
+                        CalendarIcon(size: 19).padding(4).contentShape(.rect)
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(.leading, 8).padding(.trailing, 10).padding(.top, 7).padding(.bottom, 9)
@@ -1246,17 +1461,7 @@ struct SavedView: View {
     var header: some View {
         HStack(spacing: 6) {
             // round pills, so they read as the page's filter, not a second tab bar (square boxes are the genre tags'); selected filled white
-            ForEach(SavedTab.allCases, id: \.self) { t in
-                Button { tab = t } label: {
-                    Text(t.rawValue.nts).font(.nts(11))
-                        .foregroundStyle(tab == t ? .black : .white)
-                        .padding(.horizontal, 11).padding(.vertical, 5)
-                        .background(tab == t ? .white : .clear, in: .capsule)
-                        .overlay { Capsule().strokeBorder(.white.opacity(tab == t ? 1 : 0.35), lineWidth: 1) }
-                        .contentShape(.capsule)
-                }
-                .buttonStyle(.plain)
-            }
+            ForEach(SavedTab.allCases, id: \.self) { t in Pill(text: t.rawValue, on: tab == t) { tab = t } }
             Spacer(minLength: 0)
             Menu {
                 if let e = store.email {
@@ -1302,6 +1507,22 @@ struct SavedView: View {
 
     func empty(_ text: String) -> some View {
         Text(text.nts).font(.nts(16)).opacity(0.5).frame(maxWidth: .infinity).padding(.top, 60)
+    }
+}
+
+/// A page's filter (My NTS lists, schedule channel): round, selected filled white.
+struct Pill: View {
+    let text: String, on: Bool, action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(text.nts).font(.nts(11))
+                .foregroundStyle(on ? .black : .white)
+                .padding(.horizontal, 11).padding(.vertical, 5)
+                .background(on ? .white : .clear, in: .capsule)
+                .overlay { Capsule().strokeBorder(.white.opacity(on ? 1 : 0.35), lineWidth: 1) }
+                .contentShape(.capsule)
+        }
+        .buttonStyle(.plain)
     }
 }
 
