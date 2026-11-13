@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import AVKit
 import MediaPlayer
 import Network
 
@@ -2130,7 +2131,7 @@ struct MiniPlayer: View {
                     }
                 }
                 Spacer(minLength: 8)
-                if !store.rooms.isEmpty { SpeakerButton().padding(.trailing, 14) }
+                SpeakerButton().padding(.trailing, 14)   // AirPlay is always there, Sonos rooms when found
                 Image(systemName: expanded ? "chevron.down" : "chevron.up").font(.system(size: 14, weight: .semibold)).padding(.trailing, 14)
             }
             .contentShape(.rect)
@@ -2163,18 +2164,27 @@ struct MiniPlayer: View {
 struct SpeakerButton: View {
     @Environment(Store.self) var store
     @State private var open = false
+    /// An archive episode is playing: Sonos can't fetch its HLS, so only this Mac and AirPlay (Sonos rooms included) can play it.
+    var episodeOnMac: Bool { store.playingID != nil && store.episode?.id == store.playingID }
 
     var body: some View {
         Button { open.toggle() } label: {
             Image(systemName: store.cast == nil ? "hifispeaker" : "hifispeaker.fill").font(.system(size: 14)).contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .help(store.cast.map { "Playing on \($0.name)" } ?? "Play on Sonos")
+        .help(store.cast.map { "Playing on \($0.name)" } ?? (episodeOnMac ? "This Mac or AirPlay" : "Sonos or AirPlay"))
         .popover(isPresented: $open, arrowEdge: .top) {
             VStack(alignment: .leading, spacing: 2) {
                 row("This Mac", nil)
-                ForEach(store.rooms, id: \.self) { row($0.name, $0) }
-                if store.speaker != nil {
+                if !episodeOnMac { ForEach(store.rooms, id: \.self) { row($0.name, $0) } }
+                HStack {
+                    Text("AirPlay".nts).font(.nts(13))
+                    Spacer()
+                    Image(systemName: "airplay.audio").font(.system(size: 12))
+                }
+                .padding(.horizontal, 8).frame(height: 26)
+                .overlay { AirPlayPicker(player: store.player) { store.setSpeaker(nil) } }
+                if store.speaker != nil, !episodeOnMac {   // the room's volume does nothing for an episode
                     HStack(spacing: 8) {
                         Image(systemName: "speaker.fill").font(.system(size: 11)).opacity(0.6)
                         // sent once the drag ends: one request per tick could land out of order
@@ -2196,12 +2206,30 @@ struct SpeakerButton: View {
             HStack {
                 Text(name.nts).font(.nts(13)).lineLimit(1)
                 Spacer()
-                if store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
+                if episodeOnMac ? room == nil : store.speaker == room { Image(systemName: "checkmark").font(.system(size: 11, weight: .semibold)) }
             }
             .padding(.horizontal, 8).frame(height: 26).contentShape(.rect)
         }
         .buttonStyle(.plain)
     }
+}
+
+/// The system AirPlay menu for the Mac's player, laid invisibly over a row so the whole row opens it (its button fills its frame).
+/// AirPlay carries the Mac's player, so opening it switches off Sonos.
+struct AirPlayPicker: NSViewRepresentable {
+    let player: AVPlayer, opening: () -> Void
+    final class Coordinator: NSObject, AVRoutePickerViewDelegate {
+        var opening: () -> Void = {}
+        func routePickerViewWillBeginPresentingRoutes(_ v: AVRoutePickerView) { opening() }
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> AVRoutePickerView {
+        let v = AVRoutePickerView()
+        v.alphaValue = 0   // still takes clicks
+        v.delegate = context.coordinator
+        return v
+    }
+    func updateNSView(_ v: AVRoutePickerView, context: Context) { v.player = player; context.coordinator.opening = opening }
 }
 
 /// Artwork with the show info below it, as on the NTS iPhone show page (sizes measured from it, ×0.896).
