@@ -157,6 +157,18 @@ func str(_ s: String) -> [String: Any] { ["stringValue": s] }
 
 struct APIError: LocalizedError { var errorDescription: String? }
 
+/// An error as a short line someone can act on, not the raw reply (Firebase codes, HTTP bodies).
+func friendly(_ error: Error) -> String {
+    if let u = error as? URLError { return u.code == .notConnectedToInternet ? "You're offline" : "Can't reach NTS" }
+    if error is DecodingError { return "NTS sent something unexpected" }
+    let m = error.localizedDescription
+    if ["INVALID_LOGIN_CREDENTIALS", "INVALID_PASSWORD", "EMAIL_NOT_FOUND", "INVALID_EMAIL"].contains(where: m.contains) { return "Wrong email or password" }
+    if m.contains("TOO_MANY_ATTEMPTS") { return "Too many attempts. Try again later" }
+    if m.contains("UNAUTHENTICATED") || m.contains("TOKEN_EXPIRED") { return "Signed out. Sign in again" }
+    if m.hasPrefix("resolve-stream") { return "Can't play this episode" }
+    return m
+}
+
 /// POST JSON and return the decoded reply. Google APIs report failures as {"error":{…}}
 /// (runQuery wraps it in an array), so surface that message verbatim.
 @MainActor func post(_ url: String, _ body: [String: Any]?, token: String? = nil, method: String = "POST") async throws -> Any {
@@ -549,7 +561,7 @@ enum Keychain {
                 .map({ (($0.object as? AVPlayerItem).map(ObjectIdentifier.init),($0.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error)?.localizedDescription) })
             where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
-        if !CommandLine.arguments.contains("--snapshot") { remoteCommands() }
+        if !CommandLine.arguments.contains("--snapshot") { remoteCommands(); reconnects() }
         if email != nil { Task { await loadMore(.hosts) } }   // My NTS opens on Hosts, and the schedule's following tab needs it
     }
 
@@ -838,7 +850,28 @@ enum Keychain {
     /// (bookmark check, page load) when the popover closes or the page changes mid-request.
     func report(_ error: Error) {
         if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
-        problem = error.localizedDescription
+        problem = friendly(error)
+    }
+
+    /// Waking from sleep or a network coming back: refresh at once rather than on the next poll.
+    private func reconnects() {
+        Task {
+            for await _ in NSWorkspace.shared.notificationCenter.notifications(named: NSWorkspace.didWakeNotification).map({ _ in () }) { reconnect() }
+        }
+        Task {
+            var online = true
+            for await path in NWPathMonitor() {
+                if path.status == .satisfied, !online { reconnect() }
+                online = path.status == .satisfied
+            }
+        }
+    }
+
+    func reconnect() {
+        Task { if let l: [Channel] = try? await fetch("live") { live = l; error = nil } }
+        Task { await refreshMixtapeNow() }
+        // a live stream or mixtape that ran out of retries while offline plays again; an episode keeps its error until play
+        if playingID != nil, episode?.id != playingID, streamError != nil { pauseResume() }
     }
 
     func skip(_ seconds: Double) { seek(to: position + seconds) }
