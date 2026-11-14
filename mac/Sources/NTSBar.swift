@@ -841,10 +841,13 @@ enum Keychain {
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.source else { throw APIError(errorDescription: "No audio for this episode") }
-            async let saved = email == nil ? nil : try? resumePoint(id)   // looked up while the stream resolves
+            let lookup = Task { email == nil ? nil : try? await resumePoint(id) }   // looked up while the stream resolves
             let hls = try await resolveStream(source)
-            // ponytail: server wins when it answers; a just-paused write still in flight can read stale. Compare timestamps if that bites
-            let start = await saved ?? progress[id]?.pos ?? 0
+            let timeout = Task { try await Task.sleep(for: .seconds(1.5)); lookup.cancel() }   // slow Firestore doesn't hold up playback
+            let server = await lookup.value
+            timeout.cancel()
+            // a play started after this Mac's last stop is newer; otherwise this Mac's (the server may not have its write yet)
+            let start = if let server, server.at > stoppedAt[id] ?? .distantPast { server.pos } else { progress[id]?.pos ?? 0 }
             resolvedAt = .now
             episode = (id, d)
             toggle(id, hls.absoluteString, at: start)
@@ -1123,6 +1126,7 @@ enum Keychain {
     // MARK: Archive listens, written like nts.live's writeArchivePlayStart/Stop; History is built from them.
     @ObservationIgnored private var listen: (id: String, started: Date)?
     var progress: [String: (pos: Double, length: Double)] = [:]   // by episode id: where the account last left it
+    @ObservationIgnored private var stoppedAt: [String: Date] = [:]   // by episode id: when this Mac last recorded it, to tell if the server is newer
 
     private func playFields(_ id: String, playedAt: Date, listened: Int, position: Double, length: Double) -> [String: Any] {
         let (show, ep) = aliases(id)
@@ -1169,7 +1173,7 @@ enum Keychain {
         UserDefaults.standard.removeObject(forKey: "openListen")
         let secs = Int(Date.now.timeIntervalSince(l.started).rounded(.up))
         let f = playFields(l.id, playedAt: l.started, listened: secs, position: position, length: duration)
-        if duration > 0 { progress[l.id] = (position, duration) }
+        if duration > 0 { progress[l.id] = (position, duration); stoppedAt[l.id] = .now }
         return Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays", f, token: t, uid: uid) } catch { report(error) } }
     }
 
@@ -1195,15 +1199,31 @@ enum Keychain {
     }
 
     /// Where the account last left this episode (any device: nts.live, iPhone, here), as nts.live's readArchivePlays finds plays.
-    /// nil when never played or played to (near) the end.
-    private func resumePoint(_ id: String) async throws -> Double? {
-        func val(_ f: [String: Any], _ k: String) -> String? { (f[k] as? [String: Any]).flatMap { $0["integerValue"] ?? $0["timestampValue"] } as? String }
+    /// nil when never played; pos 0 when played to (near) the end. `at` is when that play started.
+    private func resumePoint(_ id: String) async throws -> (pos: Double, at: Date)? {
         // ponytail: newest picked here, not orderBy (that needs a composite index); fine for the handful of plays per episode
+        // played_at, as loadProgress and the site's index sort by (every client writes it)
         guard let last = try await myDocs("archive_plays", id).compactMap({ $0["fields"] as? [String: Any] })
-                .max(by: { (val($0, "updated_at") ?? "") < (val($1, "updated_at") ?? "") }),
-              let pos = val(last, "current_position_s").flatMap(Double.init), pos > 0 else { return nil }
-        let length = val(last, "episode_duration_s").flatMap(Double.init) ?? 0
-        return length > 0 && pos > length - 30 ? nil : pos
+                .max(by: { (field($0, "played_at") ?? "") < (field($1, "played_at") ?? "") }),
+              let at = field(last, "played_at").flatMap(firestoreDate) else { return nil }
+        let pos = field(last, "current_position_s").flatMap(Double.init) ?? 0
+        let length = field(last, "episode_duration_s").flatMap(Double.init) ?? 0
+        return (length > 0 && pos > length - 30 ? 0 : pos, at)
+    }
+
+    /// A Firestore field as text: integers and timestamps arrive as strings, doubles (as other clients may write) as numbers.
+    private func field(_ f: [String: Any], _ k: String) -> String? {
+        guard let v = f[k] as? [String: Any] else { return nil }
+        if let d = v["doubleValue"] as? Double { return String(d) }
+        return (v["integerValue"] ?? v["stringValue"] ?? v["timestampValue"]) as? String
+    }
+
+    /// Firestore timestamps come with or without fractional seconds.
+    private func firestoreDate(_ s: String) -> Date? {
+        let f = ISO8601DateFormatter()
+        if let d = f.date(from: s) { return d }
+        f.formatOptions.insert(.withFractionalSeconds)
+        return f.date(from: s)
     }
 
     /// How far the account got through its recently played episodes (nts.live's readArchivePlays: newest first), for the rows' bars.
@@ -1211,9 +1231,8 @@ enum Keychain {
         guard email != nil, let docs = try? await myDocs("archive_plays", nil, newest: 300) else { return }
         var p: [String: (pos: Double, length: Double)] = [:]
         for d in docs.compactMap({ $0["fields"] as? [String: Any] }) {
-            func val(_ k: String) -> String? { (d[k] as? [String: Any]).flatMap { $0["integerValue"] ?? $0["stringValue"] } as? String }
-            guard let show = val("show_alias"), let ep = val("episode_alias"), !ep.isEmpty,
-                  let pos = val("current_position_s").flatMap(Double.init), let length = val("episode_duration_s").flatMap(Double.init), length > 0
+            guard let show = field(d, "show_alias"), let ep = field(d, "episode_alias"), !ep.isEmpty,
+                  let pos = field(d, "current_position_s").flatMap(Double.init), let length = field(d, "episode_duration_s").flatMap(Double.init), length > 0
             else { continue }
             let id = "/shows/\(show)/episodes/\(ep)"
             if p[id] == nil { p[id] = (pos, length) }   // newest play wins
@@ -1231,7 +1250,7 @@ enum Keychain {
         }
         if deviceIDs.isEmpty {   // nts.live's getUserDeviceIds: uid first, capped at 10
             let devs = try await query(["from": [["collectionId": "user_devices"]], "where": filter("firebase_user_uid", "EQUAL", str(uid))])
-                .compactMap { (($0["fields"] as? [String: Any])?["device_id"] as? [String: Any])?["stringValue"] as? String }
+                .compactMap { ($0["fields"] as? [String: Any]).flatMap { field($0, "device_id") } }
             deviceIDs = Array(([uid] + devs.filter { $0 != uid }).prefix(10))
         }
         let devices = filter("device_id", "IN", ["arrayValue": ["values": deviceIDs.map(str)]])
@@ -1255,8 +1274,8 @@ enum Keychain {
             self.email = email
             UserDefaults.standard.set(email, forKey: "email")
             problem = nil
-            feeds = [:]; followed = [:]; deviceIDs = []; progress = [:]
-            await loadProgress()
+            feeds = [:]; followed = [:]; deviceIDs = []; progress = [:]; stoppedAt = [:]
+            Task { await loadProgress() }   // the sign-in form needn't wait for it
         } catch { report(error) }
     }
 
