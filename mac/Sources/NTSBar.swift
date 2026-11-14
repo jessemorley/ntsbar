@@ -562,7 +562,7 @@ enum Keychain {
             where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
         if !CommandLine.arguments.contains("--snapshot") { remoteCommands(); reconnects() }
-        if email != nil { Task { await loadMore(.hosts) } }   // My NTS opens on Hosts, and the schedule's following tab needs it
+        if email != nil { Task { await loadMore(.hosts) }; Task { await loadProgress() } }   // My NTS opens on Hosts, and the schedule's following tab needs it
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
@@ -1117,6 +1117,7 @@ enum Keychain {
 
     // MARK: Archive listens, written like nts.live's writeArchivePlayStart/Stop; History is built from them.
     @ObservationIgnored private var listen: (id: String, started: Date)?
+    var progress: [String: (pos: Double, length: Double)] = [:]   // by episode id: where the account last left it
 
     private func playFields(_ id: String, playedAt: Date, listened: Int, position: Double, length: Double) -> [String: Any] {
         let (show, ep) = aliases(id)
@@ -1130,9 +1131,17 @@ enum Keychain {
     private func listenStart() {
         guard email != nil, listen == nil, let id = playingID, episode?.id == id,
               !CommandLine.arguments.contains("--snapshot") else { return }   // renders don't write listens
-        listen = (id, .now)
+        let started = Date.now
+        listen = (id, started)
         let f = playFields(id, playedAt: .now, listened: 0, position: position, length: 0)
         Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays_start", f, token: t, uid: uid) } catch { report(error) } }
+        // ponytail: a checkpoint is a stop + start, as the site writes on pause/resume (it never updates a play); every 2 min caps
+        // what a crash or another device misses, at ~30 docs an hour. History merges back-to-back plays of one episode.
+        Task {
+            try? await Task.sleep(for: .seconds(120))
+            guard listen?.started == started else { return }
+            listenStop(); listenStart()
+        }
     }
 
     /// Paused, switched away, finished or quitting: records the listen. Reads the position now, before the item changes.
@@ -1141,6 +1150,7 @@ enum Keychain {
         listen = nil
         let secs = Int(Date.now.timeIntervalSince(l.started).rounded(.up))
         let f = playFields(l.id, playedAt: l.started, listened: secs, position: position, length: duration)
+        if duration > 0 { progress[l.id] = (position, duration) }
         return Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays", f, token: t, uid: uid) } catch { report(error) } }
     }
 
@@ -1177,8 +1187,24 @@ enum Keychain {
         return length > 0 && pos > length - 30 ? nil : pos
     }
 
-    /// The account's docs in a collection for a show or episode: device_id IN [uid + user_devices], show_alias ==, episode_alias ==.
-    private func myDocs(_ collection: String, _ id: String, limit: Int? = nil) async throws -> [[String: Any]] {
+    /// How far the account got through its recently played episodes (nts.live's readArchivePlays: newest first), for the rows' bars.
+    func loadProgress() async {
+        guard email != nil, let docs = try? await myDocs("archive_plays", nil, newest: 300) else { return }
+        var p: [String: (pos: Double, length: Double)] = [:]
+        for d in docs.compactMap({ $0["fields"] as? [String: Any] }) {
+            func val(_ k: String) -> String? { (d[k] as? [String: Any]).flatMap { $0["integerValue"] ?? $0["stringValue"] } as? String }
+            guard let show = val("show_alias"), let ep = val("episode_alias"), !ep.isEmpty,
+                  let pos = val("current_position_s").flatMap(Double.init), let length = val("episode_duration_s").flatMap(Double.init), length > 0
+            else { continue }
+            let id = "/shows/\(show)/episodes/\(ep)"
+            if p[id] == nil { p[id] = (pos, length) }   // newest play wins
+        }
+        progress.merge(p) { mine, _ in mine }   // this session's own listens are newer
+    }
+
+    /// The account's docs in a collection, from all its devices: device_id IN [uid + user_devices], and for a show or episode
+    /// show_alias ==, episode_alias ==; or with `newest`, the latest that many by played_at.
+    private func myDocs(_ collection: String, _ id: String?, limit: Int? = nil, newest: Int? = nil) async throws -> [[String: Any]] {
         let (t, uid) = try await token()
         func query(_ q: [String: Any]) async throws -> [[String: Any]] {
             let r = try await post("\(firestore):runQuery", ["structuredQuery": q], token: t) as? [[String: Any]] ?? []
@@ -1189,10 +1215,13 @@ enum Keychain {
                 .compactMap { (($0["fields"] as? [String: Any])?["device_id"] as? [String: Any])?["stringValue"] as? String }
             deviceIDs = Array(([uid] + devs.filter { $0 != uid }).prefix(10))
         }
-        let (show, ep) = aliases(id)
-        var q: [String: Any] = ["from": [["collectionId": collection]], "where": ["compositeFilter": ["op": "AND", "filters": [
-            filter("device_id", "IN", ["arrayValue": ["values": deviceIDs.map(str)]]),
-            filter("show_alias", "EQUAL", str(show)), filter("episode_alias", "EQUAL", str(ep))]]]]
+        let devices = filter("device_id", "IN", ["arrayValue": ["values": deviceIDs.map(str)]])
+        var q: [String: Any] = ["from": [["collectionId": collection]], "where": devices]
+        if let id {
+            let (show, ep) = aliases(id)
+            q["where"] = ["compositeFilter": ["op": "AND", "filters": [devices, filter("show_alias", "EQUAL", str(show)), filter("episode_alias", "EQUAL", str(ep))]]]
+        }
+        if let newest { q["orderBy"] = [["field": ["fieldPath": "played_at"], "direction": "DESCENDING"]]; q["limit"] = newest }   // the site's index
         if let limit { q["limit"] = limit }
         return try await query(q)
     }
@@ -1207,13 +1236,14 @@ enum Keychain {
             self.email = email
             UserDefaults.standard.set(email, forKey: "email")
             problem = nil
-            feeds = [:]; followed = [:]; deviceIDs = []
+            feeds = [:]; followed = [:]; deviceIDs = []; progress = [:]
+            await loadProgress()
         } catch { report(error) }
     }
 
     func signOut() {
         Keychain.refreshToken = nil
-        session = nil; email = nil; feeds = [:]; problem = nil; followed = [:]; deviceIDs = []; savedTracks = []
+        session = nil; email = nil; feeds = [:]; problem = nil; followed = [:]; deviceIDs = []; savedTracks = []; progress = [:]
         UserDefaults.standard.removeObject(forKey: "email")
     }
 
@@ -2171,6 +2201,15 @@ struct EpisodeRow: View {
             Cover(url: (isEpisode ? d.media?.wideSmall : d.media?.square) ?? image).frame(width: isEpisode ? 148 : 93, height: 93)
                 .overlay(alignment: .bottomLeading) {
                     if isEpisode { playIcon(id, 15, 17).frame(width: 49, height: 45).background(.black.opacity(0.75)) }
+                }
+                .overlay(alignment: .bottom) {   // how far the account got, as on iPhone
+                    if let p = store.progress[id] {
+                        GeometryReader { g in
+                            Rectangle().fill(.white.opacity(0.3))
+                                .overlay(alignment: .leading) { Rectangle().fill(.white).frame(width: g.size.width * min(1, p.pos / p.length)) }
+                        }
+                        .frame(height: 3)
+                    }
                 }
             VStack(alignment: .leading, spacing: 4) {
                 Text((d.name ?? "").nts).font(.nts(14)).lineLimit(3).fixedSize(horizontal: false, vertical: true)
