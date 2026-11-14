@@ -566,7 +566,7 @@ enum Keychain {
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
-    func toggle(_ id: String, _ url: String) {
+    func toggle(_ id: String, _ url: String, at start: Double = 0) {
         defer { nowPlaying() }
         if playingID == id { if paused { pauseResume() } else { stop() }; return }
         guard let u = URL(string: url) else { return }
@@ -577,7 +577,7 @@ enum Keychain {
         streamURL = u
         duration = 0
         playingID = id
-        load(u)
+        load(u, at: start)
         paused = false
         mixtapeNow = nil
         Task { await refreshMixtapeNow() }
@@ -837,10 +837,12 @@ enum Keychain {
         do {
             let d: Details = try await fetchOne(String(id.dropFirst()))
             guard let source = d.source else { throw APIError(errorDescription: "No audio for this episode") }
+            async let saved = email == nil ? nil : try? resumePoint(id)   // looked up while the stream resolves
             let hls = try await resolveStream(source)
+            let start = await saved ?? 0
             resolvedAt = .now
             episode = (id, d)
-            toggle(id, hls.absoluteString)
+            toggle(id, hls.absoluteString, at: start)
             listenStart()
             problem = nil
         } catch { if pendingID == id { pendingID = nil }; report(error) }
@@ -1160,6 +1162,23 @@ enum Keychain {
     /// Firestore doc names of the favourite for a show or episode, found as nts.live's upsertFavourite does:
     /// device_id IN [uid + user_devices], show_alias ==, episode_alias == ("" for a followed show).
     private func favouriteDocs(_ id: String, limit: Int? = nil) async throws -> [String] {
+        try await myDocs("favourites", id, limit: limit).compactMap { $0["name"] as? String }
+    }
+
+    /// Where the account last left this episode (any device: nts.live, iPhone, here), as nts.live's readArchivePlays finds plays.
+    /// nil when never played or played to (near) the end.
+    private func resumePoint(_ id: String) async throws -> Double? {
+        func val(_ f: [String: Any], _ k: String) -> String? { (f[k] as? [String: Any]).flatMap { $0["integerValue"] ?? $0["timestampValue"] } as? String }
+        // ponytail: newest picked here, not orderBy (that needs a composite index); fine for the handful of plays per episode
+        guard let last = try await myDocs("archive_plays", id).compactMap({ $0["fields"] as? [String: Any] })
+                .max(by: { (val($0, "updated_at") ?? "") < (val($1, "updated_at") ?? "") }),
+              let pos = val(last, "current_position_s").flatMap(Double.init), pos > 0 else { return nil }
+        let length = val(last, "episode_duration_s").flatMap(Double.init) ?? 0
+        return length > 0 && pos > length - 30 ? nil : pos
+    }
+
+    /// The account's docs in a collection for a show or episode: device_id IN [uid + user_devices], show_alias ==, episode_alias ==.
+    private func myDocs(_ collection: String, _ id: String, limit: Int? = nil) async throws -> [[String: Any]] {
         let (t, uid) = try await token()
         func query(_ q: [String: Any]) async throws -> [[String: Any]] {
             let r = try await post("\(firestore):runQuery", ["structuredQuery": q], token: t) as? [[String: Any]] ?? []
@@ -1171,11 +1190,11 @@ enum Keychain {
             deviceIDs = Array(([uid] + devs.filter { $0 != uid }).prefix(10))
         }
         let (show, ep) = aliases(id)
-        var q: [String: Any] = ["from": [["collectionId": "favourites"]], "where": ["compositeFilter": ["op": "AND", "filters": [
+        var q: [String: Any] = ["from": [["collectionId": collection]], "where": ["compositeFilter": ["op": "AND", "filters": [
             filter("device_id", "IN", ["arrayValue": ["values": deviceIDs.map(str)]]),
             filter("show_alias", "EQUAL", str(show)), filter("episode_alias", "EQUAL", str(ep))]]]]
         if let limit { q["limit"] = limit }
-        return try await query(q).compactMap { $0["name"] as? String }
+        return try await query(q)
     }
 
     func signIn(_ email: String, _ password: String) async {
