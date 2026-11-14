@@ -562,7 +562,11 @@ enum Keychain {
             where item == player.currentItem.map(ObjectIdentifier.init) { streamFailed(why) }
         }
         if !CommandLine.arguments.contains("--snapshot") { remoteCommands(); reconnects() }
-        if email != nil { Task { await loadMore(.hosts) }; Task { await loadProgress() } }   // My NTS opens on Hosts, and the schedule's following tab needs it
+        // logout/restart/shutdown: no time for a network write, so save the position for recoverListen next launch
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveOpenListen() }
+        }
+        if email != nil { Task { await loadMore(.hosts) }; Task { await recoverListen(); await loadProgress() } }   // My NTS opens on Hosts, and the schedule's following tab needs it
     }
 
     /// Tapping the playing item stops it (pausing a live stream would just drift behind).
@@ -839,7 +843,8 @@ enum Keychain {
             guard let source = d.source else { throw APIError(errorDescription: "No audio for this episode") }
             async let saved = email == nil ? nil : try? resumePoint(id)   // looked up while the stream resolves
             let hls = try await resolveStream(source)
-            let start = await saved ?? 0
+            // ponytail: server wins when it answers; a just-paused write still in flight can read stale. Compare timestamps if that bites
+            let start = await saved ?? progress[id]?.pos ?? 0
             resolvedAt = .now
             episode = (id, d)
             toggle(id, hls.absoluteString, at: start)
@@ -1135,19 +1140,33 @@ enum Keychain {
         listen = (id, started)
         let f = playFields(id, playedAt: .now, listened: 0, position: position, length: 0)
         Task { do { let (t, uid) = try await token(); try await createDoc("archive_plays_start", f, token: t, uid: uid) } catch { report(error) } }
-        // ponytail: a checkpoint is a stop + start, as the site writes on pause/resume (it never updates a play); every 2 min caps
-        // what a crash or another device misses, at ~30 docs an hour. History merges back-to-back plays of one episode.
-        Task {
-            try? await Task.sleep(for: .seconds(120))
-            guard listen?.started == started else { return }
-            listenStop(); listenStart()
+        // plays are written only on pause/resume/stop, as nts.live does; a crash loses at most a minute (see recoverListen)
+        Task { while listen?.started == started { saveOpenListen(); try? await Task.sleep(for: .seconds(60)) } }
+    }
+
+    /// The open listen, kept locally (no Firestore writes) so a crash, force quit or shutdown can be recorded next launch.
+    private func saveOpenListen() {
+        guard let l = listen else { return }
+        UserDefaults.standard.set(["id": l.id, "started": l.started, "saved": Date.now, "position": position, "length": duration], forKey: "openListen")
+    }
+
+    /// Records a listen the app didn't get to (from saveOpenListen); kept until the write succeeds.
+    private func recoverListen() async {
+        guard let o = UserDefaults.standard.dictionary(forKey: "openListen"), let id = o["id"] as? String, let started = o["started"] as? Date,
+              let saved = o["saved"] as? Date, let pos = o["position"] as? Double, let length = o["length"] as? Double else { return }
+        let f = playFields(id, playedAt: started, listened: Int(saved.timeIntervalSince(started).rounded(.up)), position: pos, length: length)
+        do { let (t, uid) = try await token(); try await createDoc("archive_plays", f, token: t, uid: uid) } catch { return }
+        if (UserDefaults.standard.dictionary(forKey: "openListen")?["started"] as? Date) == started {   // not a listen begun since
+            UserDefaults.standard.removeObject(forKey: "openListen")
         }
+        if length > 0, progress[id] == nil { progress[id] = (pos, length) }
     }
 
     /// Paused, switched away, finished or quitting: records the listen. Reads the position now, before the item changes.
     @discardableResult func listenStop() -> Task<Void, Never>? {
         guard let l = listen else { return nil }
         listen = nil
+        UserDefaults.standard.removeObject(forKey: "openListen")
         let secs = Int(Date.now.timeIntervalSince(l.started).rounded(.up))
         let f = playFields(l.id, playedAt: l.started, listened: secs, position: position, length: duration)
         if duration > 0 { progress[l.id] = (position, duration) }
