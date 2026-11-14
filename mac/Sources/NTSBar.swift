@@ -1126,6 +1126,7 @@ enum Keychain {
     // MARK: Archive listens, written like nts.live's writeArchivePlayStart/Stop; History is built from them.
     @ObservationIgnored private var listen: (id: String, started: Date)?
     var progress: [String: (pos: Double, length: Double)] = [:]   // by episode id: where the account last left it
+    @ObservationIgnored private var progressLoadedAt: Date?   // last loadProgress, for the popover-open throttle
     @ObservationIgnored private var stoppedAt: [String: Date] = [:]   // by episode id: when this Mac last recorded it, to tell if the server is newer
 
     private func playFields(_ id: String, playedAt: Date, listened: Int, position: Double, length: Double) -> [String: Any] {
@@ -1227,17 +1228,24 @@ enum Keychain {
     }
 
     /// How far the account got through its recently played episodes (nts.live's readArchivePlays: newest first), for the rows' bars.
-    func loadProgress() async {
-        guard email != nil, let docs = try? await myDocs("archive_plays", nil, newest: 300) else { return }
-        var p: [String: (pos: Double, length: Double)] = [:]
+    /// `recent` (each popover open): at most once a minute, and only the latest 20 plays once the full 300 are in.
+    func loadProgress(recent: Bool = false) async {
+        guard email != nil else { return }
+        if recent, let t = progressLoadedAt, t > .now - 60 { return }
+        let newest = recent && progressLoadedAt != nil ? 20 : 300
+        progressLoadedAt = .now   // set before the query so overlapping calls (launch + first open) don't both run
+        guard let docs = try? await myDocs("archive_plays", nil, newest: newest) else { progressLoadedAt = nil; return }
+        var seen = Set<String>()
         for d in docs.compactMap({ $0["fields"] as? [String: Any] }) {
             guard let show = field(d, "show_alias"), let ep = field(d, "episode_alias"), !ep.isEmpty,
-                  let pos = field(d, "current_position_s").flatMap(Double.init), let length = field(d, "episode_duration_s").flatMap(Double.init), length > 0
+                  let pos = field(d, "current_position_s").flatMap(Double.init), let length = field(d, "episode_duration_s").flatMap(Double.init), length > 0,
+                  let at = field(d, "played_at").flatMap(firestoreDate)
             else { continue }
             let id = "/shows/\(show)/episodes/\(ep)"
-            if p[id] == nil { p[id] = (pos, length) }   // newest play wins
+            guard seen.insert(id).inserted else { continue }   // newest play wins
+            // unless this Mac stopped it since (its write may not be readable yet), as in playEpisode
+            if at > stoppedAt[id] ?? .distantPast, progress[id].map({ ($0.pos, $0.length) != (pos, length) }) ?? true { progress[id] = (pos, length) }
         }
-        progress.merge(p) { mine, _ in mine }   // this session's own listens are newer
     }
 
     /// The account's docs in a collection, from all its devices: device_id IN [uid + user_devices], and for a show or episode
@@ -1274,7 +1282,7 @@ enum Keychain {
             self.email = email
             UserDefaults.standard.set(email, forKey: "email")
             problem = nil
-            feeds = [:]; followed = [:]; deviceIDs = []; progress = [:]; stoppedAt = [:]
+            feeds = [:]; followed = [:]; deviceIDs = []; progress = [:]; stoppedAt = [:]; progressLoadedAt = nil
             Task { await loadProgress() }   // the sign-in form needn't wait for it
         } catch { report(error) }
     }
@@ -1367,9 +1375,11 @@ enum Keychain {
 }
 
 struct Popover: View {
+    @Environment(Store.self) private var store
     var page = Page.live
     var body: some View {
         RootView(page: page)
+            .task { await store.loadProgress(recent: true) }   // each time it opens: picks up plays from other devices
             .frame(width: 360)
             .foregroundStyle(.white)
             .preferredColorScheme(.dark)
