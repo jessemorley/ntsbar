@@ -1542,6 +1542,35 @@ enum Page { case live, nowPlaying, mixtapes, saved
     ]
 }
 
+/// The Now Playing tab icon: animate-ui's audio-lines (lucide), its bars bouncing while audio plays.
+struct AudioLines: View {
+    var playing: Bool
+    /// Each bar's (top, bottom) keyframes in a 24-pt box, evenly spaced over 1.5s, linear; the first is the still pose.
+    static let bars: [[(Double, Double)]] = [
+        [(10, 13), (5, 18), (8, 15), (6, 17), (10, 13)],
+        [(6, 17), (2, 22), (10, 13), (6, 17)],
+        [(3, 21), (6, 17), (3, 21), (8, 15), (3, 21)],
+        [(8, 15), (4, 19), (7, 16), (2, 22), (8, 15)],
+        [(5, 18), (10, 13), (4, 19), (8, 15), (5, 18)],
+        [(10, 13), (8, 15), (5, 18), (10, 13)],
+    ]
+    var body: some View {
+        TimelineView(.animation(paused: !playing)) { ctx in
+            Canvas { g, size in
+                let s = size.width / 24
+                let t = playing ? ctx.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.5) / 1.5 : 0
+                for (i, k) in Self.bars.enumerated() {
+                    let p = t * Double(k.count - 1), j = min(Int(p), k.count - 2), f = p - Double(j)
+                    let y1 = k[j].0 + (k[j + 1].0 - k[j].0) * f, y2 = k[j].1 + (k[j + 1].1 - k[j].1) * f
+                    let x = Double(2 + 4 * i) * s
+                    var bar = Path(); bar.move(to: CGPoint(x: x, y: y1 * s)); bar.addLine(to: CGPoint(x: x, y: y2 * s))
+                    g.stroke(bar, with: .foreground, style: StrokeStyle(lineWidth: 2 * s, lineCap: .round))
+                }
+            }
+        }
+    }
+}
+
 /// A soft glow easing across the progress line while audio loads.
 struct Shimmer: View {
     var body: some View {
@@ -1683,7 +1712,8 @@ struct RootView: View {
                     page = t.page
                 } label: {
                     VStack(spacing: 4) {
-                        Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22)
+                        if t.page == .nowPlaying { AudioLines(playing: store.playingID != nil && !store.paused).frame(width: 22, height: 22) }
+                        else { Image(systemName: t.icon).font(.system(size: 19)).frame(height: 22) }
                         Text(t.label.nts).font(.nts(10))
                     }
                     .frame(maxWidth: .infinity, minHeight: 54).contentShape(.rect)
