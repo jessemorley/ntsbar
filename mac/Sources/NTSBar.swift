@@ -2187,8 +2187,13 @@ struct SavedView: View {
     @State private var headerHeight: CGFloat = 48
     /// The tabs float over the list, as the app's tabs do, so the list never resizes.
     var header: some View {
-        // as the schedule's header: icon left, plain tabs right (selected full white, the rest dimmed)
+        // plain tabs left, account icon right (selected full white, the rest dimmed)
         HStack(spacing: 16) {
+            ForEach(SavedTab.allCases, id: \.self) { t in
+                Button { tab = t } label: { Text(t.rawValue.nts).font(.nts(13)).frame(height: 28).contentShape(.rect) }
+                    .buttonStyle(.plain).opacity(tab == t ? 1 : 0.45)
+            }
+            Spacer(minLength: 0)
             Menu {
                 if let e = store.email {
                     Text(e)
@@ -2200,11 +2205,6 @@ struct SavedView: View {
                 Image(systemName: "person.circle")   // a menu: account, Quit
             }
             .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize().tint(.white)
-            Spacer(minLength: 0)
-            ForEach(SavedTab.allCases, id: \.self) { t in
-                Button { tab = t } label: { Text(t.rawValue.nts).font(.nts(13)).frame(height: 28).contentShape(.rect) }
-                    .buttonStyle(.plain).opacity(tab == t ? 1 : 0.45)
-            }
         }
         .padding(.horizontal, pageInset).padding(.vertical, 8)
         .fixedSize(horizontal: false, vertical: true)
