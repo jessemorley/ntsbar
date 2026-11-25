@@ -10,7 +10,7 @@ cp .build/release/NTSBar "$APP/MacOS/"
 mkdir -p "$APP/Resources"
 # Icon Composer icon -> Assets.car (Liquid Glass) + NTSBar.icns fallback
 xcrun actool NTSBar.icon --compile "$APP/Resources" --app-icon NTSBar --platform macosx \
-  --minimum-deployment-target 27.0 --output-partial-info-plist /dev/null >/dev/null
+  --minimum-deployment-target 26.0 --output-partial-info-plist /dev/null >/dev/null
 cat > "$APP/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -22,7 +22,7 @@ cat > "$APP/Info.plist" <<PLIST
   <key>CFBundleIconName</key><string>NTSBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSUIElement</key><true/>
-  <key>LSMinimumSystemVersion</key><string>27.0</string>
+  <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>NSLocalNetworkUsageDescription</key><string>NTS finds Sonos speakers on your network to play radio on them.</string>
   <key>NSBonjourServices</key><array><string>_sonos._tcp</string></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
