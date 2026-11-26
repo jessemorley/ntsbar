@@ -1,4 +1,4 @@
-# NTSBAR
+# NTSBar
 
 An unofficial macOS menu bar player for [NTS Radio](https://www.nts.live). Requires macOS 26 or later.
 
