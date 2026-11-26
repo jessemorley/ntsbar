@@ -1358,7 +1358,11 @@ enum Keychain {
             // an episode path (/shows/x/episodes/y) really loads it, muted
             if let j = args.firstIndex(of: "--playing"), j + 1 < args.count {
                 let id = args[j + 1]
-                if id.hasPrefix("/shows/") { s.player.isMuted = true; Task { await s.playEpisode(id) } } else { s.playingID = id }
+                if id.hasPrefix("/shows/") {
+                    // --at <seconds> starts the episode there (when the account has no newer play)
+                    if let k = args.firstIndex(of: "--at"), k + 1 < args.count, let at = Double(args[k + 1]) { s.progress[id] = (at, 0) }
+                    s.player.isMuted = true; Task { await s.playEpisode(id) }
+                } else { s.playingID = id }
             }
             snapshot(s, to: args[i + 1], page: args.contains("now") ? .nowPlaying : args.contains("mixtapes") ? .mixtapes : args.contains("saved") ? .saved : .live)
         }
